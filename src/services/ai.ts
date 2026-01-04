@@ -1,6 +1,6 @@
-import OpenAI from 'openai';
-import { Config } from '../config';
-import { processDiff } from '../utils';
+import OpenAI from "openai";
+import { Config } from "../config";
+import { processDiff } from "../utils";
 
 export interface AIReviewResponse {
   summary: string;
@@ -23,7 +23,10 @@ export class AIService {
     });
   }
 
-  async getReview(diff: string, customInstructions?: string): Promise<AIReviewResponse> {
+  async getReview(
+    diff: string,
+    customInstructions?: string,
+  ): Promise<AIReviewResponse> {
     const processedDiff = processDiff(diff);
     const systemPrompt = `
 ${this.config.systemMessage}
@@ -48,7 +51,7 @@ IMPORTANT:
 `;
 
     const userPrompt = `
-${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ''}
+${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
 
 Review the following git diff:
 ${processedDiff}
@@ -56,26 +59,26 @@ ${processedDiff}
 
     try {
       console.log(`Sending diff to AI. Length: ${processedDiff.length}`);
-      
+
       const completion = await this.openai.chat.completions.create({
         model: this.config.model,
         messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
         ],
-        response_format: { type: 'json_object' },
+        response_format: { type: "json_object" },
       });
 
       const content = completion.choices[0].message.content;
       if (!content) {
-        throw new Error('Empty response from AI');
+        throw new Error("Empty response from AI");
       }
 
       const response = JSON.parse(content) as AIReviewResponse;
-      console.log('AI Parsed Response:', JSON.stringify(response, null, 2));
+      console.log("AI Parsed Response:", JSON.stringify(response, null, 2));
       return response;
     } catch (error) {
-      console.error('Error calling AI service:', error);
+      console.error("Error calling AI service:", error);
       throw error;
     }
   }
