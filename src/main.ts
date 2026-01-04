@@ -41,7 +41,7 @@ async function run(): Promise<void> {
 
       // Important: Avoid infinite loops. Don't reply to our own comments.
       const currentUser = await githubService.getAuthenticatedUser();
-      if (comment!.user.id === currentUser.id) {
+      if (comment!.user.login === currentUser.login) {
         return;
       }
 
@@ -130,7 +130,7 @@ async function run(): Promise<void> {
       const comments = await githubService.listComments(prNumber);
       for (const comment of comments) {
         if (
-          comment.user?.id === currentUser.id &&
+          comment.user?.login === currentUser.login &&
           !comment.body?.includes("👀 AI Review started")
         ) {
           await githubService.deleteComment(comment.id);
@@ -140,7 +140,7 @@ async function run(): Promise<void> {
       // Delete Review Comments (Inline comments)
       const reviewComments = await githubService.listReviewComments(prNumber);
       for (const comment of reviewComments) {
-        if (comment.user?.id === currentUser.id) {
+        if (comment.user?.login === currentUser.login) {
           await githubService.deleteReviewComment(comment.id);
         }
       }

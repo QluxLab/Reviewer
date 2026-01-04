@@ -70,8 +70,16 @@ export class GitHubService {
   }
 
   async getAuthenticatedUser() {
-    const { data: user } = await this.octokit.rest.users.getAuthenticated();
-    return user;
+    try {
+      const { data: user } = await this.octokit.rest.users.getAuthenticated();
+      return user;
+    } catch (error) {
+      core.debug("Could not get authenticated user (likely using GITHUB_TOKEN), falling back to github-actions[bot]");
+      return {
+        login: "github-actions[bot]",
+        id: -1,
+      } as any;
+    }
   }
 
   async listComments(prNumber: number) {
@@ -145,7 +153,7 @@ export class GitHubService {
       return threadComments.map(c => ({
         author: c.user?.login || 'Unknown',
         body: c.body,
-        isBot: c.user?.id === botUser.id
+        isBot: c.user?.login === botUser.login
       }));
     } catch (error) {
       core.warning(`Failed to fetch comment thread: ${error instanceof Error ? error.message : 'Unknown error'}`);
