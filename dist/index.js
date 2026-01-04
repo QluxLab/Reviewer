@@ -35969,17 +35969,33 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getConfig = getConfig;
 const core = __importStar(__nccwpck_require__(7484));
 function getConfig() {
+    const minSeverityInput = core.getInput("min_severity") || "low";
+    const minSeverity = normalizeSeverity(minSeverityInput);
+    // Validate minSeverity input
+    if (minSeverityInput !== minSeverity) {
+        core.warning(`Invalid min_severity value "${minSeverityInput}", defaulting to "${minSeverity}"`);
+    }
     return {
-        openaiApiKey: core.getInput('openai_api_key', { required: true }),
-        openaiBaseUrl: core.getInput('openai_base_url') || 'https://api.openai.com/v1',
-        model: core.getInput('model') || 'gpt-4o',
-        githubToken: core.getInput('github_token', { required: true }),
-        systemMessage: core.getInput('system_message') || 'You are an expert code reviewer. Provide a summary of changes and inline comments for improvements.',
-        ignorePatterns: (core.getInput('ignore_patterns') || '')
-            .split(',')
+        openaiApiKey: core.getInput("openai_api_key", { required: true }),
+        openaiBaseUrl: core.getInput("openai_base_url") || "https://api.openai.com/v1",
+        model: core.getInput("model") || "gpt-4o",
+        githubToken: core.getInput("github_token", { required: true }),
+        systemMessage: core.getInput("system_message") ||
+            "You are an expert code reviewer. Provide a summary of changes and inline comments for improvements.",
+        ignorePatterns: (core.getInput("ignore_patterns") || "")
+            .split(",")
             .map((p) => p.trim())
             .filter((p) => p.length > 0),
+        minSeverity,
     };
+}
+function normalizeSeverity(severity) {
+    const lower = severity.toLowerCase().trim();
+    if (['low', 'medium', 'high', 'critical'].includes(lower)) {
+        return lower;
+    }
+    // Default to 'low' for invalid severity values
+    return 'low';
 }
 
 
@@ -36039,31 +36055,31 @@ async function run() {
         let prNumber;
         let customInstructions;
         // 1. Event Handling
-        if (eventName === 'pull_request') {
-            if (payload.action !== 'opened' && payload.action !== 'synchronize') {
+        if (eventName === "pull_request") {
+            if (payload.action !== "opened" && payload.action !== "synchronize") {
                 core.info(`Skipping action: ${payload.action}`);
                 return;
             }
             prNumber = payload.pull_request.number;
         }
-        else if (eventName === 'issue_comment') {
-            if (payload.action !== 'created')
+        else if (eventName === "issue_comment") {
+            if (payload.action !== "created")
                 return;
             const commentBody = payload.comment.body;
             const { isReview, instructions } = (0, utils_1.parseReviewComment)(commentBody);
             if (!isReview) {
-                core.info('Comment is not a /review command. Skipping.');
+                core.info("Comment is not a /review command. Skipping.");
                 return;
             }
             // Ensure it's a PR comment, not just an Issue comment
             if (!payload.issue.pull_request) {
-                core.info('Comment is on an Issue, not a PR. Skipping.');
+                core.info("Comment is on an Issue, not a PR. Skipping.");
                 return;
             }
             prNumber = payload.issue.number;
             customInstructions = instructions;
             // Post a reaction to acknowledge the command
-            await githubService.postComment(prNumber, '👀 AI Review started...');
+            await githubService.postComment(prNumber, "👀 AI Review started...");
         }
         else {
             core.info(`Unsupported event: ${eventName}`);
@@ -36073,7 +36089,7 @@ async function run() {
         const changedFiles = await githubService.getChangedFiles(prNumber);
         const filesToReview = changedFiles.filter((file) => !(0, utils_1.isFileIgnored)(file, config.ignorePatterns));
         if (filesToReview.length === 0) {
-            core.info('No files to review after filtering.');
+            core.info("No files to review after filtering.");
             return;
         }
         // 3. Fetch Diff
@@ -36081,7 +36097,7 @@ async function run() {
         // TODO: Improve diff handling for very large PRs (truncation or chunking)
         // For now, we pass the raw diff.
         // 4. Get AI Review
-        core.info('Requesting review from AI...');
+        core.info("Requesting review from AI...");
         const review = await aiService.getReview(diff, customInstructions);
         // 5. Post Summary
         if (review.summary) {
@@ -36089,21 +36105,46 @@ async function run() {
         }
         // 6. Post Inline Comments
         if (review.comments && review.comments.length > 0) {
-            const validComments = review.comments.filter(c => filesToReview.includes(c.file));
-            await githubService.createReview(prNumber, validComments.map(c => ({
-                path: c.file,
-                line: c.line,
-                body: c.body
-            })));
+            const validComments = review.comments.filter((c) => filesToReview.includes(c.file));
+            // Filter comments based on severity
+            const minSeverityLevel = (0, utils_1.getSeverityLevel)(config.minSeverity);
+            const filteredComments = validComments.filter(c => (0, utils_1.getSeverityLevel)(c.severity) >= minSeverityLevel);
+            // Log filtering results
+            const filteredCount = validComments.length - filteredComments.length;
+            if (filteredCount > 0) {
+                core.info(`Filtered ${filteredCount} comments below ${config.minSeverity} severity level`);
+                core.info(`Posting ${filteredComments.length} comments meeting ${config.minSeverity} severity or higher`);
+            }
+            else {
+                core.info(`All ${validComments.length} comments meet ${config.minSeverity} severity level or higher`);
+            }
+            // Log severity distribution for debugging
+            const severityCounts = {
+                low: 0,
+                medium: 0,
+                high: 0,
+                critical: 0
+            };
+            validComments.forEach(c => {
+                severityCounts[c.severity]++;
+            });
+            core.debug(`Severity distribution: ${JSON.stringify(severityCounts)}`);
+            if (filteredComments.length > 0) {
+                await githubService.createReview(prNumber, filteredComments.map((c) => ({
+                    path: c.file,
+                    line: c.line,
+                    body: c.body,
+                })));
+            }
         }
-        core.info('Review completed successfully.');
+        core.info("Review completed successfully.");
     }
     catch (error) {
         if (error instanceof Error) {
             core.setFailed(error.message);
         }
         else {
-            core.setFailed('An unknown error occurred');
+            core.setFailed("An unknown error occurred");
         }
     }
 }
@@ -36117,6 +36158,39 @@ run();
 
 "use strict";
 
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -36124,6 +36198,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.AIService = void 0;
 const openai_1 = __importDefault(__nccwpck_require__(2583));
 const utils_1 = __nccwpck_require__(1798);
+const core = __importStar(__nccwpck_require__(7484));
 class AIService {
     constructor(config) {
         this.config = config;
@@ -36144,7 +36219,8 @@ You must respond in valid JSON format with the following schema:
     {
       "file": "filename",
       "line": line_number_in_diff,
-      "body": "comment text"
+      "body": "comment text",
+      "severity": "low|medium|high|critical"
     }
   ]
 }
@@ -36153,10 +36229,15 @@ IMPORTANT:
 - The diff provided to you includes line numbers for each line of code.
 - The 'line' in your response MUST be the exact line number shown in the diff corresponding to the code you are commenting on.
 - Only comment on lines that are changed in the diff (lines starting with '+').
+- Assign a severity level to each comment:
+  - 'low': Minor style issues, suggestions, or trivial improvements
+  - 'medium': Potential bugs, performance concerns, or moderate issues
+  - 'high': Likely bugs, security concerns, or significant problems
+  - 'critical': Severe security vulnerabilities, crashes, or blocking issues
 - If there are no specific comments, return an empty array for "comments".
 `;
         const userPrompt = `
-${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ''}
+${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
 
 Review the following git diff:
 ${processedDiff}
@@ -36166,23 +36247,45 @@ ${processedDiff}
             const completion = await this.openai.chat.completions.create({
                 model: this.config.model,
                 messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userPrompt },
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userPrompt },
                 ],
-                response_format: { type: 'json_object' },
+                response_format: { type: "json_object" },
             });
             const content = completion.choices[0].message.content;
             if (!content) {
-                throw new Error('Empty response from AI');
+                throw new Error("Empty response from AI");
             }
             const response = JSON.parse(content);
-            console.log('AI Parsed Response:', JSON.stringify(response, null, 2));
+            // Validate and normalize severity levels
+            if (response.comments) {
+                const originalCount = response.comments.length;
+                response.comments = response.comments.map(comment => ({
+                    ...comment,
+                    severity: this.normalizeSeverity(comment.severity)
+                }));
+                // Check for comments with invalid severity (normalized to 'low')
+                const invalidSeverityCount = response.comments.filter(c => c.severity === 'low').length;
+                if (invalidSeverityCount > 0) {
+                    core.warning(`Found ${invalidSeverityCount} comments with invalid severity levels, defaulting to 'low'`);
+                }
+                core.info(`Processed ${originalCount} comments with severity levels`);
+            }
+            console.log("AI Parsed Response:", JSON.stringify(response, null, 2));
             return response;
         }
         catch (error) {
-            console.error('Error calling AI service:', error);
+            console.error("Error calling AI service:", error);
             throw error;
         }
+    }
+    normalizeSeverity(severity) {
+        const lower = severity.toLowerCase().trim();
+        if (['low', 'medium', 'high', 'critical'].includes(lower)) {
+            return lower;
+        }
+        // Default to 'low' for invalid severity values
+        return 'low';
     }
 }
 exports.AIService = AIService;
@@ -36244,7 +36347,7 @@ class GitHubService {
             ...this.repo,
             pull_number: prNumber,
             mediaType: {
-                format: 'diff',
+                format: "diff",
             },
         });
         // @ts-ignore - The type definition doesn't always reflect that data is string for mediaType diff
@@ -36263,8 +36366,8 @@ class GitHubService {
         await this.octokit.rest.pulls.createReview({
             ...this.repo,
             pull_number: prNumber,
-            event: 'COMMENT',
-            comments: comments.map(c => ({
+            event: "COMMENT",
+            comments: comments.map((c) => ({
                 path: c.path,
                 line: c.line,
                 body: c.body,
@@ -36276,12 +36379,12 @@ class GitHubService {
             ...this.repo,
             pull_number: prNumber,
         });
-        return files.map(f => f.filename);
+        return files.map((f) => f.filename);
     }
     async getPRDetails(prNumber) {
         const { data: pr } = await this.octokit.rest.pulls.get({
             ...this.repo,
-            pull_number: prNumber
+            pull_number: prNumber,
         });
         return pr;
     }
@@ -36302,11 +36405,13 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isFileIgnored = isFileIgnored;
 exports.parseReviewComment = parseReviewComment;
+exports.getSeverityLevel = getSeverityLevel;
+exports.normalizeSeverity = normalizeSeverity;
 exports.processDiff = processDiff;
 const minimatch_1 = __nccwpck_require__(6507);
 const parse_diff_1 = __importDefault(__nccwpck_require__(2673));
 function isFileIgnored(filename, ignorePatterns) {
-    return ignorePatterns.some(pattern => {
+    return ignorePatterns.some((pattern) => {
         const matcher = new minimatch_1.Minimatch(pattern, { dot: true });
         return matcher.match(filename);
     });
@@ -36314,14 +36419,32 @@ function isFileIgnored(filename, ignorePatterns) {
 // Simple logic to parse /review command and extra args
 function parseReviewComment(comment) {
     const trimmed = comment.trim();
-    if (!trimmed.startsWith('/review')) {
+    if (!trimmed.startsWith("/review")) {
         return { isReview: false };
     }
-    const instructions = trimmed.replace('/review', '').trim();
+    const instructions = trimmed.replace("/review", "").trim();
     return {
         isReview: true,
         instructions: instructions.length > 0 ? instructions : undefined,
     };
+}
+function getSeverityLevel(severity) {
+    const levels = {
+        low: 0,
+        medium: 1,
+        high: 2,
+        critical: 3
+    };
+    const normalized = severity.toLowerCase().trim();
+    return levels[normalized] ?? 0;
+}
+function normalizeSeverity(severity) {
+    const lower = severity.toLowerCase().trim();
+    if (['low', 'medium', 'high', 'critical'].includes(lower)) {
+        return lower;
+    }
+    // Default to 'low' for invalid severity values
+    return 'low';
 }
 function processDiff(diff) {
     try {
@@ -36332,7 +36455,7 @@ function processDiff(diff) {
             // Add the original header lines for this file
             processedLines.push(`diff --git a/${file.from} b/${file.to}`);
             if (file.index) {
-                processedLines.push(`index ${file.index.join(' ')}`);
+                processedLines.push(`index ${file.index.join(" ")}`);
             }
             processedLines.push(`--- a/${file.from}`);
             processedLines.push(`+++ b/${file.to}`);
@@ -36342,22 +36465,22 @@ function processDiff(diff) {
                 processedLines.push(chunk.content);
                 // Process each change in the chunk
                 for (const change of chunk.changes) {
-                    if (change.type === 'add') {
+                    if (change.type === "add") {
                         // Added line - use ln (which is the new file line number)
                         processedLines.push(`${change.ln.toString().padStart(5)}: ${change.content}`);
                     }
-                    else if (change.type === 'normal') {
+                    else if (change.type === "normal") {
                         // Context line - use ln2 (new file line number)
                         processedLines.push(`${change.ln2.toString().padStart(5)}: ${change.content}`);
                     }
-                    else if (change.type === 'del') {
+                    else if (change.type === "del") {
                         // Deleted line - doesn't exist in new file, so no line number
                         processedLines.push(`       : ${change.content}`);
                     }
                 }
             }
         }
-        return processedLines.join('\n');
+        return processedLines.join("\n");
     }
     catch (error) {
         throw new Error(`Failed to parse diff: ${error instanceof Error ? error.message : String(error)}`);

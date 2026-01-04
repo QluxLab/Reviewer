@@ -1,6 +1,9 @@
 import OpenAI from "openai";
 import { Config } from "../config";
 import { processDiff } from "../utils";
+import * as core from "@actions/core";
+
+export type SeverityLevel = "low" | "medium" | "high" | "critical";
 
 export interface AIReviewResponse {
   summary: string;
@@ -8,6 +11,7 @@ export interface AIReviewResponse {
     file: string;
     line: number;
     body: string;
+    severity: SeverityLevel;
   }>;
 }
 
@@ -38,7 +42,8 @@ You must respond in valid JSON format with the following schema:
     {
       "file": "filename",
       "line": line_number_in_diff,
-      "body": "comment text"
+      "body": "comment text",
+      "severity": "low|medium|high|critical"
     }
   ]
 }
@@ -47,6 +52,11 @@ IMPORTANT:
 - The diff provided to you includes line numbers for each line of code.
 - The 'line' in your response MUST be the exact line number shown in the diff corresponding to the code you are commenting on.
 - Only comment on lines that are changed in the diff (lines starting with '+').
+- Assign a severity level to each comment:
+  - 'low': Minor style issues, suggestions, or trivial improvements
+  - 'medium': Potential bugs, performance concerns, or moderate issues
+  - 'high': Likely bugs, security concerns, or significant problems
+  - 'critical': Severe security vulnerabilities, crashes, or blocking issues
 - If there are no specific comments, return an empty array for "comments".
 `;
 
@@ -75,11 +85,43 @@ ${processedDiff}
       }
 
       const response = JSON.parse(content) as AIReviewResponse;
+
+      // Validate and normalize severity levels
+      if (response.comments) {
+        const originalCount = response.comments.length;
+        response.comments = response.comments.map((comment) => ({
+          ...comment,
+          severity: this.normalizeSeverity(comment.severity),
+        }));
+
+        // Check for comments with invalid severity (normalized to 'low')
+        const invalidSeverityCount = response.comments.filter(
+          (c) => c.severity === "low",
+        ).length;
+
+        if (invalidSeverityCount > 0) {
+          core.warning(
+            `Found ${invalidSeverityCount} comments with invalid severity levels, defaulting to 'low'`,
+          );
+        }
+
+        core.info(`Processed ${originalCount} comments with severity levels`);
+      }
+
       console.log("AI Parsed Response:", JSON.stringify(response, null, 2));
       return response;
     } catch (error) {
       console.error("Error calling AI service:", error);
       throw error;
     }
+  }
+
+  private normalizeSeverity(severity: string): SeverityLevel {
+    const lower = severity.toLowerCase().trim();
+    if (["low", "medium", "high", "critical"].includes(lower)) {
+      return lower as SeverityLevel;
+    }
+    // Default to 'low' for invalid severity values
+    return "low";
   }
 }

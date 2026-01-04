@@ -3,7 +3,12 @@ import * as github from "@actions/github";
 import { getConfig } from "./config";
 import { GitHubService } from "./services/github";
 import { AIService } from "./services/ai";
-import { isFileIgnored, parseReviewComment } from "./utils";
+import {
+  isFileIgnored,
+  parseReviewComment,
+  getSeverityLevel,
+  SeverityLevel,
+} from "./utils";
 
 async function run(): Promise<void> {
   try {
@@ -83,14 +88,50 @@ async function run(): Promise<void> {
       const validComments = review.comments.filter((c) =>
         filesToReview.includes(c.file),
       );
-      await githubService.createReview(
-        prNumber,
-        validComments.map((c) => ({
-          path: c.file,
-          line: c.line,
-          body: c.body,
-        })),
+
+      // Filter comments based on severity
+      const minSeverityLevel = getSeverityLevel(config.minSeverity);
+      const filteredComments = validComments.filter(
+        (c) => getSeverityLevel(c.severity) >= minSeverityLevel,
       );
+
+      // Log filtering results
+      const filteredCount = validComments.length - filteredComments.length;
+      if (filteredCount > 0) {
+        core.info(
+          `Filtered ${filteredCount} comments below ${config.minSeverity} severity level`,
+        );
+        core.info(
+          `Posting ${filteredComments.length} comments meeting ${config.minSeverity} severity or higher`,
+        );
+      } else {
+        core.info(
+          `All ${validComments.length} comments meet ${config.minSeverity} severity level or higher`,
+        );
+      }
+
+      // Log severity distribution for debugging
+      const severityCounts: Record<SeverityLevel, number> = {
+        low: 0,
+        medium: 0,
+        high: 0,
+        critical: 0,
+      };
+      validComments.forEach((c) => {
+        severityCounts[c.severity]++;
+      });
+      core.debug(`Severity distribution: ${JSON.stringify(severityCounts)}`);
+
+      if (filteredComments.length > 0) {
+        await githubService.createReview(
+          prNumber,
+          filteredComments.map((c) => ({
+            path: c.file,
+            line: c.line,
+            body: c.body,
+          })),
+        );
+      }
     }
 
     core.info("Review completed successfully.");

@@ -1,5 +1,7 @@
 import * as core from "@actions/core";
 
+export type SeverityLevel = "low" | "medium" | "high" | "critical";
+
 export interface Config {
   openaiApiKey: string;
   openaiBaseUrl: string;
@@ -7,9 +9,20 @@ export interface Config {
   githubToken: string;
   systemMessage: string;
   ignorePatterns: string[];
+  minSeverity: SeverityLevel;
 }
 
 export function getConfig(): Config {
+  const minSeverityInput = core.getInput("min_severity") || "low";
+  const minSeverity = normalizeSeverity(minSeverityInput);
+
+  // Validate minSeverity input
+  if (minSeverityInput !== minSeverity) {
+    core.warning(
+      `Invalid min_severity value "${minSeverityInput}", defaulting to "${minSeverity}"`,
+    );
+  }
+
   return {
     openaiApiKey: core.getInput("openai_api_key", { required: true }),
     openaiBaseUrl:
@@ -23,5 +36,15 @@ export function getConfig(): Config {
       .split(",")
       .map((p: string) => p.trim())
       .filter((p: string) => p.length > 0),
+    minSeverity,
   };
+}
+
+function normalizeSeverity(severity: string): SeverityLevel {
+  const lower = severity.toLowerCase().trim();
+  if (["low", "medium", "high", "critical"].includes(lower)) {
+    return lower as SeverityLevel;
+  }
+  // Default to 'low' for invalid severity values
+  return "low";
 }

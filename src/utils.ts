@@ -1,6 +1,8 @@
 import { Minimatch } from "minimatch";
 import parseDiff from "parse-diff";
 
+export type SeverityLevel = "low" | "medium" | "high" | "critical";
+
 export function isFileIgnored(
   filename: string,
   ignorePatterns: string[],
@@ -26,6 +28,26 @@ export function parseReviewComment(comment: string): {
     isReview: true,
     instructions: instructions.length > 0 ? instructions : undefined,
   };
+}
+
+export function getSeverityLevel(severity: string): number {
+  const levels: Record<SeverityLevel, number> = {
+    low: 0,
+    medium: 1,
+    high: 2,
+    critical: 3,
+  };
+  const normalized = severity.toLowerCase().trim() as SeverityLevel;
+  return levels[normalized] ?? 0;
+}
+
+export function normalizeSeverity(severity: string): SeverityLevel {
+  const lower = severity.toLowerCase().trim();
+  if (["low", "medium", "high", "critical"].includes(lower)) {
+    return lower as SeverityLevel;
+  }
+  // Default to 'low' for invalid severity values
+  return "low";
 }
 
 export function processDiff(diff: string): string {

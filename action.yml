@@ -25,6 +25,10 @@ inputs:
     description: 'Glob patterns of files to ignore (comma separated)'
     required: false
     default: 'package-lock.json,yarn.lock,dist/**,*.svg'
+  min_severity:
+    description: 'Minimum severity level for comments to be posted (low, medium, high, critical)'
+    required: false
+    default: 'low'
 runs:
   using: 'node20'
   main: 'dist/index.js'
