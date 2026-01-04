@@ -1,0 +1,33 @@
+name: 'AI Code Reviewer'
+description: 'AI-powered code review for Pull Requests using OpenAI-compatible APIs'
+author: 'finett'
+inputs:
+  openai_api_key:
+    description: 'API Key for OpenAI or compatible service'
+    required: true
+  openai_base_url:
+    description: 'Base URL for the API'
+    required: false
+    default: 'https://api.openai.com/v1'
+  model:
+    description: 'Model to use for review'
+    required: false
+    default: 'gpt-4o'
+  github_token:
+    description: 'GitHub Token to post comments'
+    required: true
+    default: '${{ github.token }}'
+  system_message:
+    description: 'Custom system instructions for the AI'
+    required: false
+    default: 'You are an expert code reviewer. Provide a summary of changes and inline comments for improvements.'
+  ignore_patterns:
+    description: 'Glob patterns of files to ignore (comma separated)'
+    required: false
+    default: 'package-lock.json,yarn.lock,dist/**,*.svg'
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
+branding:
+  icon: 'git-pull-request'
+  color: 'blue'
