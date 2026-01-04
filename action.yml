@@ -1,4 +1,4 @@
-name: 'AI Code Reviewer'
+name: 'Code Reviewer'
 description: 'AI-powered code review for Pull Requests using OpenAI-compatible APIs'
 author: 'finett'
 inputs:
