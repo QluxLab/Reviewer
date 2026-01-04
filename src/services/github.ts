@@ -68,4 +68,89 @@ export class GitHubService {
     });
     return pr;
   }
+
+  async getAuthenticatedUser() {
+    const { data: user } = await this.octokit.rest.users.getAuthenticated();
+    return user;
+  }
+
+  async listComments(prNumber: number) {
+    const { data: comments } = await this.octokit.rest.issues.listComments({
+      ...this.repo,
+      issue_number: prNumber,
+    });
+    return comments;
+  }
+
+  async deleteComment(commentId: number) {
+    await this.octokit.rest.issues.deleteComment({
+      ...this.repo,
+      comment_id: commentId,
+    });
+  }
+
+  async listReviewComments(prNumber: number) {
+    const { data: comments } = await this.octokit.rest.pulls.listReviewComments({
+      ...this.repo,
+      pull_number: prNumber,
+    });
+    return comments;
+  }
+
+  async deleteReviewComment(commentId: number) {
+    await this.octokit.rest.pulls.deleteReviewComment({
+      ...this.repo,
+      comment_id: commentId,
+    });
+  }
+
+  async createReply(prNumber: number, commentId: number, body: string) {
+    await this.octokit.rest.pulls.createReplyForReviewComment({
+      ...this.repo,
+      pull_number: prNumber,
+      comment_id: commentId,
+      body,
+    });
+  }
+
+  async getCommentThread(prNumber: number, commentId: number): Promise<Array<{author: string; body: string; isBot: boolean}>> {
+    try {
+      // Fetch the specific comment to get its position in the thread
+      const { data: comment } = await this.octokit.rest.pulls.getReviewComment({
+        ...this.repo,
+        pull_number: prNumber,
+        comment_id: commentId,
+      });
+
+      // Get all review comments for the PR
+      const { data: allComments } = await this.octokit.rest.pulls.listReviewComments({
+        ...this.repo,
+        pull_number: prNumber,
+      });
+
+      // Find comments in the same thread (same file, same position, same commit)
+      const threadComments = allComments.filter(c =>
+        c.path === comment.path &&
+        c.position === comment.position &&
+        c.commit_id === comment.commit_id
+      );
+
+      // Sort by created_at to get chronological order
+      threadComments.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+
+      // Get authenticated user to identify bot comments
+      const botUser = await this.getAuthenticatedUser();
+
+      // Format thread data
+      return threadComments.map(c => ({
+        author: c.user?.login || 'Unknown',
+        body: c.body,
+        isBot: c.user?.id === botUser.id
+      }));
+    } catch (error) {
+      core.warning(`Failed to fetch comment thread: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      // Return empty array on failure, caller can handle gracefully
+      return [];
+    }
+  }
 }

@@ -27,6 +27,52 @@ async function run(): Promise<void> {
         return;
       }
       prNumber = payload.pull_request!.number;
+    } else if (eventName === "pull_request_review_comment") {
+      // Handle user replies to AI comments
+      if (payload.action !== "created") return;
+
+      const comment = payload.comment;
+      const pr = payload.pull_request;
+      prNumber = pr!.number;
+
+      // Check if the reply is to a comment made by this bot or if it's just a general reply
+      // Ideally we would check if the parent comment is from the bot.
+      // But for now, we'll respond if the user explicitly asks the bot or if it's in a thread the bot started.
+
+      // Important: Avoid infinite loops. Don't reply to our own comments.
+      const currentUser = await githubService.getAuthenticatedUser();
+      if (comment!.user.id === currentUser.id) {
+        return;
+      }
+
+      // We need to fetch the thread context
+      const diff = await githubService.getPullRequestDiff(prNumber);
+
+      // Fetch the full comment thread
+      core.info("Fetching comment thread for context...");
+      const threadComments = await githubService.getCommentThread(prNumber, comment!.id);
+
+      // Construct the comment chain with full thread context
+      let commentChain = "";
+      if (threadComments.length > 0) {
+        // Build a structured conversation history
+        commentChain = "Conversation History:\n";
+        threadComments.forEach((threadComment, index) => {
+          const authorPrefix = threadComment.isBot ? "AI Reviewer" : threadComment.author;
+          commentChain += `${index + 1}. ${authorPrefix}: ${threadComment.body}\n`;
+        });
+        core.info(`Thread context built with ${threadComments.length} comments`);
+      } else {
+        // Fallback to single comment if thread fetching failed
+        commentChain = `User: ${comment!.body}`;
+        core.info("Using fallback single comment context");
+      }
+
+      core.info("Generating reply to user comment...");
+      const reply = await aiService.generateReply(diff, commentChain);
+
+      await githubService.createReply(prNumber, comment!.id, reply);
+      return;
     } else if (eventName === "issue_comment") {
       if (payload.action !== "created") return;
 
@@ -74,6 +120,37 @@ async function run(): Promise<void> {
     // 4. Get AI Review
     core.info("Requesting review from AI...");
     const review = await aiService.getReview(diff, customInstructions);
+
+    // Cleanup previous reviews
+    core.info("Removing outdated comments...");
+    try {
+      const currentUser = await githubService.getAuthenticatedUser();
+
+      // Delete Issue Comments (General comments)
+      const comments = await githubService.listComments(prNumber);
+      for (const comment of comments) {
+        if (
+          comment.user?.id === currentUser.id &&
+          !comment.body?.includes("👀 AI Review started")
+        ) {
+          await githubService.deleteComment(comment.id);
+        }
+      }
+
+      // Delete Review Comments (Inline comments)
+      const reviewComments = await githubService.listReviewComments(prNumber);
+      for (const comment of reviewComments) {
+        if (comment.user?.id === currentUser.id) {
+          await githubService.deleteReviewComment(comment.id);
+        }
+      }
+    } catch (error) {
+      core.warning(
+        `Failed to remove outdated comments: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+    }
 
     // 5. Post Summary
     if (review.summary) {

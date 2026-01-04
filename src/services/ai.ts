@@ -27,6 +27,49 @@ export class AIService {
     });
   }
 
+  async generateReply(
+    diff: string,
+    commentChain: string,
+    customInstructions?: string,
+  ): Promise<string> {
+    const systemPrompt = `
+${this.config.systemMessage}
+
+You are replying to a user's comment on a code review.
+Your goal is to be helpful, clarify your previous review comments if needed, or acknowledge the user's feedback.
+Keep your response concise and professional.
+`;
+
+    const userPrompt = `
+${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
+
+Context (Code Diff):
+${processDiff(diff)}
+
+Comment Chain:
+${commentChain}
+    `;
+
+    try {
+      const completion = await this.openai.chat.completions.create({
+        model: this.config.model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      });
+
+      const content = completion.choices[0].message.content;
+      if (!content) {
+        throw new Error("Empty response from AI");
+      }
+      return content;
+    } catch (error) {
+      console.error("Error generating reply:", error);
+      throw error;
+    }
+  }
+
   async getReview(
     diff: string,
     customInstructions?: string,

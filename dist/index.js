@@ -35991,11 +35991,11 @@ function getConfig() {
 }
 function normalizeSeverity(severity) {
     const lower = severity.toLowerCase().trim();
-    if (['low', 'medium', 'high', 'critical'].includes(lower)) {
+    if (["low", "medium", "high", "critical"].includes(lower)) {
         return lower;
     }
     // Default to 'low' for invalid severity values
-    return 'low';
+    return "low";
 }
 
 
@@ -36062,6 +36062,32 @@ async function run() {
             }
             prNumber = payload.pull_request.number;
         }
+        else if (eventName === "pull_request_review_comment") {
+            // Handle user replies to AI comments
+            if (payload.action !== "created")
+                return;
+            const comment = payload.comment;
+            const pr = payload.pull_request;
+            prNumber = pr.number;
+            // Check if the reply is to a comment made by this bot or if it's just a general reply
+            // Ideally we would check if the parent comment is from the bot.
+            // But for now, we'll respond if the user explicitly asks the bot or if it's in a thread the bot started.
+            // Important: Avoid infinite loops. Don't reply to our own comments.
+            const currentUser = await githubService.getAuthenticatedUser();
+            if (comment.user.id === currentUser.id) {
+                return;
+            }
+            // We need to fetch the thread context
+            const diff = await githubService.getPullRequestDiff(prNumber);
+            // Construct the comment chain
+            // Note: In a real implementation we would fetch the full thread.
+            // Here we will just use the current comment and the diff snippet if available.
+            const commentChain = `User: ${comment.body}`;
+            core.info("Generating reply to user comment...");
+            const reply = await aiService.generateReply(diff, commentChain);
+            await githubService.createReply(prNumber, comment.id, reply);
+            return;
+        }
         else if (eventName === "issue_comment") {
             if (payload.action !== "created")
                 return;
@@ -36099,6 +36125,29 @@ async function run() {
         // 4. Get AI Review
         core.info("Requesting review from AI...");
         const review = await aiService.getReview(diff, customInstructions);
+        // Cleanup previous reviews
+        core.info("Removing outdated comments...");
+        try {
+            const currentUser = await githubService.getAuthenticatedUser();
+            // Delete Issue Comments (General comments)
+            const comments = await githubService.listComments(prNumber);
+            for (const comment of comments) {
+                if (comment.user?.id === currentUser.id &&
+                    !comment.body?.includes("👀 AI Review started")) {
+                    await githubService.deleteComment(comment.id);
+                }
+            }
+            // Delete Review Comments (Inline comments)
+            const reviewComments = await githubService.listReviewComments(prNumber);
+            for (const comment of reviewComments) {
+                if (comment.user?.id === currentUser.id) {
+                    await githubService.deleteReviewComment(comment.id);
+                }
+            }
+        }
+        catch (error) {
+            core.warning(`Failed to remove outdated comments: ${error instanceof Error ? error.message : "Unknown error"}`);
+        }
         // 5. Post Summary
         if (review.summary) {
             await githubService.postComment(prNumber, `## AI Review Summary\n\n${review.summary}`);
@@ -36108,7 +36157,7 @@ async function run() {
             const validComments = review.comments.filter((c) => filesToReview.includes(c.file));
             // Filter comments based on severity
             const minSeverityLevel = (0, utils_1.getSeverityLevel)(config.minSeverity);
-            const filteredComments = validComments.filter(c => (0, utils_1.getSeverityLevel)(c.severity) >= minSeverityLevel);
+            const filteredComments = validComments.filter((c) => (0, utils_1.getSeverityLevel)(c.severity) >= minSeverityLevel);
             // Log filtering results
             const filteredCount = validComments.length - filteredComments.length;
             if (filteredCount > 0) {
@@ -36123,9 +36172,9 @@ async function run() {
                 low: 0,
                 medium: 0,
                 high: 0,
-                critical: 0
+                critical: 0,
             };
-            validComments.forEach(c => {
+            validComments.forEach((c) => {
                 severityCounts[c.severity]++;
             });
             core.debug(`Severity distribution: ${JSON.stringify(severityCounts)}`);
@@ -36207,6 +36256,42 @@ class AIService {
             baseURL: config.openaiBaseUrl,
         });
     }
+    async generateReply(diff, commentChain, customInstructions) {
+        const systemPrompt = `
+${this.config.systemMessage}
+
+You are replying to a user's comment on a code review.
+Your goal is to be helpful, clarify your previous review comments if needed, or acknowledge the user's feedback.
+Keep your response concise and professional.
+`;
+        const userPrompt = `
+${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
+
+Context (Code Diff):
+${(0, utils_1.processDiff)(diff)}
+
+Comment Chain:
+${commentChain}
+    `;
+        try {
+            const completion = await this.openai.chat.completions.create({
+                model: this.config.model,
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userPrompt },
+                ],
+            });
+            const content = completion.choices[0].message.content;
+            if (!content) {
+                throw new Error("Empty response from AI");
+            }
+            return content;
+        }
+        catch (error) {
+            console.error("Error generating reply:", error);
+            throw error;
+        }
+    }
     async getReview(diff, customInstructions) {
         const processedDiff = (0, utils_1.processDiff)(diff);
         const systemPrompt = `
@@ -36260,12 +36345,12 @@ ${processedDiff}
             // Validate and normalize severity levels
             if (response.comments) {
                 const originalCount = response.comments.length;
-                response.comments = response.comments.map(comment => ({
+                response.comments = response.comments.map((comment) => ({
                     ...comment,
-                    severity: this.normalizeSeverity(comment.severity)
+                    severity: this.normalizeSeverity(comment.severity),
                 }));
                 // Check for comments with invalid severity (normalized to 'low')
-                const invalidSeverityCount = response.comments.filter(c => c.severity === 'low').length;
+                const invalidSeverityCount = response.comments.filter((c) => c.severity === "low").length;
                 if (invalidSeverityCount > 0) {
                     core.warning(`Found ${invalidSeverityCount} comments with invalid severity levels, defaulting to 'low'`);
                 }
@@ -36281,11 +36366,11 @@ ${processedDiff}
     }
     normalizeSeverity(severity) {
         const lower = severity.toLowerCase().trim();
-        if (['low', 'medium', 'high', 'critical'].includes(lower)) {
+        if (["low", "medium", "high", "critical"].includes(lower)) {
             return lower;
         }
         // Default to 'low' for invalid severity values
-        return 'low';
+        return "low";
     }
 }
 exports.AIService = AIService;
@@ -36388,6 +36473,44 @@ class GitHubService {
         });
         return pr;
     }
+    async getAuthenticatedUser() {
+        const { data: user } = await this.octokit.rest.users.getAuthenticated();
+        return user;
+    }
+    async listComments(prNumber) {
+        const { data: comments } = await this.octokit.rest.issues.listComments({
+            ...this.repo,
+            issue_number: prNumber,
+        });
+        return comments;
+    }
+    async deleteComment(commentId) {
+        await this.octokit.rest.issues.deleteComment({
+            ...this.repo,
+            comment_id: commentId,
+        });
+    }
+    async listReviewComments(prNumber) {
+        const { data: comments } = await this.octokit.rest.pulls.listReviewComments({
+            ...this.repo,
+            pull_number: prNumber,
+        });
+        return comments;
+    }
+    async deleteReviewComment(commentId) {
+        await this.octokit.rest.pulls.deleteReviewComment({
+            ...this.repo,
+            comment_id: commentId,
+        });
+    }
+    async createReply(prNumber, commentId, body) {
+        await this.octokit.rest.pulls.createReplyForReviewComment({
+            ...this.repo,
+            pull_number: prNumber,
+            comment_id: commentId,
+            body,
+        });
+    }
 }
 exports.GitHubService = GitHubService;
 
@@ -36433,18 +36556,18 @@ function getSeverityLevel(severity) {
         low: 0,
         medium: 1,
         high: 2,
-        critical: 3
+        critical: 3,
     };
     const normalized = severity.toLowerCase().trim();
     return levels[normalized] ?? 0;
 }
 function normalizeSeverity(severity) {
     const lower = severity.toLowerCase().trim();
-    if (['low', 'medium', 'high', 'critical'].includes(lower)) {
+    if (["low", "medium", "high", "critical"].includes(lower)) {
         return lower;
     }
     // Default to 'low' for invalid severity values
-    return 'low';
+    return "low";
 }
 function processDiff(diff) {
     try {
