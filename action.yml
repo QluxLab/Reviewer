@@ -1,4 +1,4 @@
-name: 'Code Reviewer'
+name: 'Qlux Code Reviewer'
 description: 'AI-powered code review for Pull Requests using OpenAI-compatible APIs'
 author: 'finett'
 inputs:
