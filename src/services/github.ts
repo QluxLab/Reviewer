@@ -100,6 +100,47 @@ export class GitHubService {
     return comments;
   }
 
+  async listBotComments(prNumber: number): Promise<
+    Array<{ id: number; body: string; path?: string; line?: number; type: "issue" | "review" }>
+  > {
+    const botUser = await this.getAuthenticatedUser();
+    const result: Array<{
+      id: number;
+      body: string;
+      path?: string;
+      line?: number;
+      type: "issue" | "review";
+    }> = [];
+
+    // 1. Issue Comments (General)
+    const issueComments = await this.listComments(prNumber);
+    for (const comment of issueComments) {
+      if (comment.user?.login === botUser.login) {
+        result.push({
+          id: comment.id,
+          body: comment.body || "",
+          type: "issue",
+        });
+      }
+    }
+
+    // 2. Review Comments (Inline)
+    const reviewComments = await this.listReviewComments(prNumber);
+    for (const comment of reviewComments) {
+      if (comment.user?.login === botUser.login) {
+        result.push({
+          id: comment.id,
+          body: comment.body,
+          path: comment.path,
+          line: comment.line || comment.original_line || undefined,
+          type: "review",
+        });
+      }
+    }
+
+    return result;
+  }
+
   async deleteReviewComment(commentId: number) {
     await this.octokit.rest.pulls.deleteReviewComment({
       ...this.repo,

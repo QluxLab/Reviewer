@@ -10,6 +10,7 @@ export interface Config {
   systemMessage: string;
   ignorePatterns: string[];
   minSeverity: SeverityLevel;
+  disableInline: boolean;
 }
 
 export function getConfig(): Config {
@@ -37,6 +38,7 @@ export function getConfig(): Config {
       .map((p: string) => p.trim())
       .filter((p: string) => p.length > 0),
     minSeverity,
+    disableInline: core.getBooleanInput("disable_inline"),
   };
 }
 

@@ -13,6 +13,7 @@ export interface AIReviewResponse {
     body: string;
     severity: SeverityLevel;
   }>;
+  deleteCommentIds?: number[];
 }
 
 export class AIService {
@@ -86,6 +87,13 @@ Keep your response concise and professional.
 
   async getReview(
     diff: string,
+    existingComments: Array<{
+      id: number;
+      body: string;
+      path?: string;
+      line?: number;
+      type: "issue" | "review";
+    }>,
     customInstructions?: string,
   ): Promise<AIReviewResponse> {
     const processedDiff = processDiff(diff);
@@ -94,14 +102,13 @@ ${this.config.systemMessage}
 
 IMPORTANT:
 - The diff provided to you includes line numbers for each line of code.
-- The 'line' in your response MUST be the exact line number shown in the diff corresponding to the code you are commenting on.
 - Only comment on lines that are changed in the diff (lines starting with '+').
 - Assign a severity level to each comment:
   - 'low': Minor style issues, suggestions, or trivial improvements
   - 'medium': Potential bugs, performance concerns, or moderate issues
   - 'high': Likely bugs, security concerns, or significant problems
   - 'critical': Severe security vulnerabilities, crashes, or blocking issues
-- If there are no specific comments, return an empty array for "comments".
+- You can delete your old comments if they are no longer relevant (e.g., the issue was fixed).
 `;
 
     const userPrompt = `
@@ -109,7 +116,85 @@ ${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
 
 Review the following git diff:
 ${processedDiff}
+
+Here are your existing comments on this PR:
+${JSON.stringify(existingComments, null, 2)}
+
+Use the available tools to submit your review and manage comments.
     `;
+
+    // Define tools
+    const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+      {
+        type: "function",
+        function: {
+          name: "delete_comment",
+          description: "Delete an existing comment that is no longer valid or relevant.",
+          parameters: {
+            type: "object",
+            properties: {
+              comment_id: {
+                type: "integer",
+                description: "The ID of the comment to delete",
+              },
+            },
+            required: ["comment_id"],
+            additionalProperties: false,
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "submit_review",
+          description: "Submit the code review with a summary and optional inline comments.",
+          parameters: {
+            type: "object",
+            properties: {
+              summary: {
+                type: "string",
+                description: "Markdown summary of the review",
+              },
+              // Only include 'comments' field if inline comments are NOT disabled
+              ...(!this.config.disableInline
+                ? {
+                    comments: {
+                      type: "array",
+                      description: "List of inline comments",
+                      items: {
+                        type: "object",
+                        properties: {
+                          file: {
+                            type: "string",
+                            description: "The file path",
+                          },
+                          line: {
+                            type: "number",
+                            description: "The line number in the diff (must be a line starting with +)",
+                          },
+                          body: {
+                            type: "string",
+                            description: "The comment text",
+                          },
+                          severity: {
+                            type: "string",
+                            enum: ["low", "medium", "high", "critical"],
+                            description: "Severity level of the issue",
+                          },
+                        },
+                        required: ["file", "line", "body", "severity"],
+                        additionalProperties: false,
+                      },
+                    },
+                  }
+                : {}),
+            },
+            required: this.config.disableInline ? ["summary"] : ["summary", "comments"],
+            additionalProperties: false,
+          },
+        },
+      },
+    ];
 
     try {
       console.log(`Sending diff to AI. Length: ${processedDiff.length}`);
@@ -120,84 +205,42 @@ ${processedDiff}
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
         ],
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "review_response",
-            strict: true,
-            schema: {
-              type: "object",
-              properties: {
-                summary: {
-                  type: "string",
-                  description: "Markdown summary of the review",
-                },
-                comments: {
-                  type: "array",
-                  description: "List of inline comments",
-                  items: {
-                    type: "object",
-                    properties: {
-                      file: {
-                        type: "string",
-                        description: "The file path",
-                      },
-                      line: {
-                        type: "number",
-                        description: "The line number in the diff",
-                      },
-                      body: {
-                        type: "string",
-                        description: "The comment text",
-                      },
-                      severity: {
-                        type: "string",
-                        enum: ["low", "medium", "high", "critical"],
-                        description: "Severity level of the issue",
-                      },
-                    },
-                    required: ["file", "line", "body", "severity"],
-                    additionalProperties: false,
-                  },
-                },
-              },
-              required: ["summary", "comments"],
-              additionalProperties: false,
-            },
-          },
-        },
+        tools: tools,
+        tool_choice: "required", // Force the model to call at least one tool
       });
 
-      const content = completion.choices[0].message.content;
-      if (!content) {
-        throw new Error("Empty response from AI");
-      }
+      const response: AIReviewResponse = {
+        summary: "",
+        comments: [],
+        deleteCommentIds: [],
+      };
 
-      const response = JSON.parse(content) as AIReviewResponse;
+      const toolCalls = completion.choices[0].message.tool_calls;
 
-      // Validate and normalize severity levels
-      if (response.comments) {
-        const originalCount = response.comments.length;
-        response.comments = response.comments.map((comment) => ({
-          ...comment,
-          severity: this.normalizeSeverity(comment.severity),
-        }));
+      if (toolCalls) {
+        for (const toolCall of toolCalls) {
+          const args = JSON.parse(toolCall.function.arguments);
 
-        // Check for comments with invalid severity (normalized to 'low')
-        const invalidSeverityCount = response.comments.filter(
-          (c) => c.severity === "low",
-        ).length;
-
-        if (invalidSeverityCount > 0) {
-          core.warning(
-            `Found ${invalidSeverityCount} comments with invalid severity levels, defaulting to 'low'`,
-          );
+          if (toolCall.function.name === "delete_comment") {
+            response.deleteCommentIds!.push(args.comment_id);
+          } else if (toolCall.function.name === "submit_review") {
+            response.summary = args.summary;
+            if (args.comments) {
+              response.comments = args.comments.map((c: any) => ({
+                ...c,
+                severity: this.normalizeSeverity(c.severity),
+              }));
+            }
+          }
         }
-
-        core.info(`Processed ${originalCount} comments with severity levels`);
       }
 
-      console.log("AI Parsed Response:", JSON.stringify(response, null, 2));
+      // If submit_review wasn't called (unlikely with tool_choice: required, but possible if model loops on deletes), handle gracefully
+      if (!response.summary && !response.deleteCommentIds?.length) {
+          // Fallback or warning could go here, but for now we trust the model to behave
+          core.warning("AI did not submit a review summary.");
+      }
+      
       return response;
     } catch (error) {
       console.error("Error calling AI service:", error);

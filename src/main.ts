@@ -125,63 +125,46 @@ async function run(): Promise<void> {
     // TODO: Improve diff handling for very large PRs (truncation or chunking)
     // For now, we pass the raw diff.
 
-    // 4. Get AI Review
+    // 4. Fetch Existing Comments for Context
+    core.info("Fetching existing comments...");
+    const existingComments = await githubService.listBotComments(prNumber);
+
+    // 5. Get AI Review
     core.info("Requesting review from AI...");
-    const review = await aiService.getReview(diff, customInstructions);
+    const review = await aiService.getReview(diff, existingComments, customInstructions);
 
-    // Cleanup previous reviews
-    core.info("Removing outdated comments...");
-    try {
-      // Clean up previous comments from github-actions[bot]
-      // We strictly target this bot user as requested
-
-      // Delete Issue Comments (General comments)
-      const comments = await githubService.listComments(prNumber);
-      for (const comment of comments) {
-        if (
-          comment.user?.login === "github-actions[bot]" &&
-          !comment.body?.includes("👀 AI Review started")
-        ) {
-          try {
-            await githubService.deleteComment(comment.id);
-          } catch (deleteError) {
-            core.warning(
-              `Failed to delete comment ${comment.id}: ${
-                deleteError instanceof Error
-                  ? deleteError.message
-                  : "Unknown error"
-              }`,
-            );
+    // 6. Delete Outdated Comments (as requested by AI)
+    if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
+      core.info(`Deleting ${review.deleteCommentIds.length} outdated comments...`);
+      for (const commentId of review.deleteCommentIds) {
+        try {
+          // Try deleting as general comment first, then review comment if fails?
+          // Actually, we should know the type, but listBotComments aggregates them.
+          // Since the ID is unique across both (in GitHub API mostly, but safer to try both or lookup),
+          // let's look up the type from our existingComments list for efficiency.
+          const commentInfo = existingComments.find(c => c.id === commentId);
+          if (commentInfo) {
+            if (commentInfo.type === 'issue') {
+               await githubService.deleteComment(commentId);
+            } else {
+               await githubService.deleteReviewComment(commentId);
+            }
+          } else {
+             // Fallback if not found in our cache (unlikely)
+             // Try review comment first as they are more common in reviews
+             try {
+                await githubService.deleteReviewComment(commentId);
+             } catch {
+                await githubService.deleteComment(commentId);
+             }
           }
+        } catch (error) {
+           core.warning(`Failed to delete comment ${commentId}: ${error}`);
         }
       }
-
-      // Delete Review Comments (Inline comments)
-      const reviewComments = await githubService.listReviewComments(prNumber);
-      for (const comment of reviewComments) {
-        if (comment.user?.login === "github-actions[bot]") {
-          try {
-            await githubService.deleteReviewComment(comment.id);
-          } catch (deleteError) {
-            core.warning(
-              `Failed to delete review comment ${comment.id}: ${
-                deleteError instanceof Error
-                  ? deleteError.message
-                  : "Unknown error"
-              }`,
-            );
-          }
-        }
-      }
-    } catch (error) {
-      core.warning(
-        `Failed to remove outdated comments: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      );
     }
 
-    // 5. Post Summary
+    // 7. Post Summary
     if (review.summary) {
       await githubService.postComment(
         prNumber,
@@ -189,7 +172,7 @@ async function run(): Promise<void> {
       );
     }
 
-    // 6. Post Inline Comments
+    // 8. Post Inline Comments
     if (review.comments && review.comments.length > 0) {
       const validComments = review.comments.filter((c) =>
         filesToReview.includes(c.file),

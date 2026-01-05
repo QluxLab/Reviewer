@@ -29,6 +29,10 @@ inputs:
     description: 'Minimum severity level for comments to be posted (low, medium, high, critical)'
     required: false
     default: 'low'
+  disable_inline:
+    description: 'Disable inline comments generation and posting'
+    required: false
+    default: 'false'
 runs:
   using: 'node20'
   main: 'dist/index.js'
