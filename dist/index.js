@@ -35987,6 +35987,7 @@ function getConfig() {
             .map((p) => p.trim())
             .filter((p) => p.length > 0),
         minSeverity,
+        disableInline: core.getBooleanInput("disable_inline"),
     };
 }
 function normalizeSeverity(severity) {
@@ -36139,52 +36140,69 @@ async function run() {
         const diff = await githubService.getPullRequestDiff(prNumber);
         // TODO: Improve diff handling for very large PRs (truncation or chunking)
         // For now, we pass the raw diff.
-        // 4. Get AI Review
-        core.info("Requesting review from AI...");
-        const review = await aiService.getReview(diff, customInstructions);
-        // Cleanup previous reviews
-        core.info("Removing outdated comments...");
-        try {
-            // Clean up previous comments from github-actions[bot]
-            // We strictly target this bot user as requested
-            // Delete Issue Comments (General comments)
-            const comments = await githubService.listComments(prNumber);
-            for (const comment of comments) {
-                if (comment.user?.login === "github-actions[bot]" &&
-                    !comment.body?.includes("👀 AI Review started")) {
-                    try {
+        // 4. Fetch Existing Comments for Context
+        core.info("Fetching existing comments...");
+        let existingComments = await githubService.listBotComments(prNumber);
+        // If it's a synchronize event (new commit), clear previous comments for a fresh start
+        if (eventName === "pull_request" && payload.action === "synchronize") {
+            core.info("Synchronize event detected: Cleaning up previous reviews...");
+            for (const comment of existingComments) {
+                try {
+                    if (comment.type === "issue") {
                         await githubService.deleteComment(comment.id);
                     }
-                    catch (deleteError) {
-                        core.warning(`Failed to delete comment ${comment.id}: ${deleteError instanceof Error
-                            ? deleteError.message
-                            : "Unknown error"}`);
-                    }
-                }
-            }
-            // Delete Review Comments (Inline comments)
-            const reviewComments = await githubService.listReviewComments(prNumber);
-            for (const comment of reviewComments) {
-                if (comment.user?.login === "github-actions[bot]") {
-                    try {
+                    else {
                         await githubService.deleteReviewComment(comment.id);
                     }
-                    catch (deleteError) {
-                        core.warning(`Failed to delete review comment ${comment.id}: ${deleteError instanceof Error
-                            ? deleteError.message
-                            : "Unknown error"}`);
+                }
+                catch (error) {
+                    core.warning(`Failed to delete comment ${comment.id}: ${error}`);
+                }
+            }
+            existingComments = [];
+        }
+        // 5. Get AI Review
+        core.info("Requesting review from AI...");
+        const review = await aiService.getReview(diff, existingComments, customInstructions);
+        // 6. Delete Outdated Comments (as requested by AI)
+        if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
+            core.info(`Deleting ${review.deleteCommentIds.length} outdated comments...`);
+            for (const commentId of review.deleteCommentIds) {
+                try {
+                    // Try deleting as general comment first, then review comment if fails?
+                    // Actually, we should know the type, but listBotComments aggregates them.
+                    // Since the ID is unique across both (in GitHub API mostly, but safer to try both or lookup),
+                    // let's look up the type from our existingComments list for efficiency.
+                    const commentInfo = existingComments.find(c => c.id === commentId);
+                    if (commentInfo) {
+                        if (commentInfo.type === 'issue') {
+                            await githubService.deleteComment(commentId);
+                        }
+                        else {
+                            await githubService.deleteReviewComment(commentId);
+                        }
                     }
+                    else {
+                        // Fallback if not found in our cache (unlikely)
+                        // Try review comment first as they are more common in reviews
+                        try {
+                            await githubService.deleteReviewComment(commentId);
+                        }
+                        catch {
+                            await githubService.deleteComment(commentId);
+                        }
+                    }
+                }
+                catch (error) {
+                    core.warning(`Failed to delete comment ${commentId}: ${error}`);
                 }
             }
         }
-        catch (error) {
-            core.warning(`Failed to remove outdated comments: ${error instanceof Error ? error.message : "Unknown error"}`);
-        }
-        // 5. Post Summary
+        // 7. Post Summary
         if (review.summary) {
             await githubService.postComment(prNumber, `## AI Review Summary\n\n${review.summary}`);
         }
-        // 6. Post Inline Comments
+        // 8. Post Inline Comments
         if (review.comments && review.comments.length > 0) {
             const validComments = review.comments.filter((c) => filesToReview.includes(c.file));
             // Filter comments based on severity
@@ -36214,7 +36232,7 @@ async function run() {
                 await githubService.createReview(prNumber, filteredComments.map((c) => ({
                     path: c.file,
                     line: c.line,
-                    body: c.body,
+                    body: `**[${c.severity.toUpperCase()}]** ${c.body}`,
                 })));
             }
         }
@@ -36336,28 +36354,159 @@ Keep your response concise and professional.
             throw error;
         }
     }
-    async getReview(diff, customInstructions) {
+    async getReview(diff, existingComments, customInstructions) {
         const processedDiff = (0, utils_1.processDiff)(diff);
         const systemPrompt = `
-${this.config.systemMessage}
+## Role
 
-IMPORTANT:
+You're a senior software engineer conducting a thorough code review. Provide constructive, actionable feedback.
+
+## Review Areas
+
+Analyze the selected code for:
+
+1. **Security Issues**
+   - Input validation and sanitization
+   - Authentication and authorization
+   - Data exposure risks
+   - Injection vulnerabilities
+
+2. **Performance & Efficiency**
+   - Algorithm complexity
+   - Memory usage patterns
+   - Database query optimization
+   - Unnecessary computations
+
+3. **Code Quality**
+   - Readability and maintainability
+   - Proper naming conventions
+   - Function/class size and responsibility
+   - Code duplication
+
+4. **Architecture & Design**
+   - Design pattern usage
+   - Separation of concerns
+   - Dependency management
+   - Error handling strategy
+
+5. **Testing & Documentation**
+   - Test coverage and quality
+   - Documentation completeness
+   - Comment clarity and necessity
+
+## Output Format
+
+Provide feedback as:
+
+**🔴 Critical Issues** - Must fix before merge
+**🟡 Suggestions** - Improvements to consider
+**✅ Good Practices** - What's done well
+
+For each issue:
+- Specific line references
+- Clear explanation of the problem
+- Suggested solution with code example
+- Rationale for the change
+
+Focus on: ${customInstructions || "General code improvements and best practices"}
+
+Be constructive and educational in your feedback.
+
+IMPORTANT IMPLEMENTATION DETAILS:
 - The diff provided to you includes line numbers for each line of code.
-- The 'line' in your response MUST be the exact line number shown in the diff corresponding to the code you are commenting on.
 - Only comment on lines that are changed in the diff (lines starting with '+').
-- Assign a severity level to each comment:
-  - 'low': Minor style issues, suggestions, or trivial improvements
-  - 'medium': Potential bugs, performance concerns, or moderate issues
-  - 'high': Likely bugs, security concerns, or significant problems
-  - 'critical': Severe security vulnerabilities, crashes, or blocking issues
-- If there are no specific comments, return an empty array for "comments".
+- Use the available tools to submit the review.
+- For inline comments (using the 'comments' tool parameter), map the severity as follows:
+  - **🔴 Critical Issues** -> 'critical' or 'high'
+  - **🟡 Suggestions** -> 'medium' or 'low'
+- Use the **Output Format** guidelines above to structure your 'summary' field.
+- Be precise and confident in your feedback. Avoid vague language.
+- Directly state the issue and the solution.
+- You can delete your old comments if they are no longer relevant (e.g., the issue was fixed).
 `;
         const userPrompt = `
 ${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
 
 Review the following git diff:
 ${processedDiff}
+
+Here are your existing comments on this PR:
+${JSON.stringify(existingComments, null, 2)}
+
+Use the available tools to submit your review and manage comments.
     `;
+        // Define tools
+        const tools = [
+            {
+                type: "function",
+                function: {
+                    name: "delete_comment",
+                    description: "Delete an existing comment that is no longer valid or relevant.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            comment_id: {
+                                type: "integer",
+                                description: "The ID of the comment to delete",
+                            },
+                        },
+                        required: ["comment_id"],
+                        additionalProperties: false,
+                    },
+                },
+            },
+            {
+                type: "function",
+                function: {
+                    name: "submit_review",
+                    description: "Submit the code review with a summary and optional inline comments.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            summary: {
+                                type: "string",
+                                description: "Markdown summary of the review",
+                            },
+                            // Only include 'comments' field if inline comments are NOT disabled
+                            ...(!this.config.disableInline
+                                ? {
+                                    comments: {
+                                        type: "array",
+                                        description: "List of inline comments",
+                                        items: {
+                                            type: "object",
+                                            properties: {
+                                                file: {
+                                                    type: "string",
+                                                    description: "The file path",
+                                                },
+                                                line: {
+                                                    type: "number",
+                                                    description: "The line number in the diff (must be a line starting with +)",
+                                                },
+                                                body: {
+                                                    type: "string",
+                                                    description: "The comment text",
+                                                },
+                                                severity: {
+                                                    type: "string",
+                                                    enum: ["low", "medium", "high", "critical"],
+                                                    description: "Severity level of the issue",
+                                                },
+                                            },
+                                            required: ["file", "line", "body", "severity"],
+                                            additionalProperties: false,
+                                        },
+                                    },
+                                }
+                                : {}),
+                        },
+                        required: this.config.disableInline ? ["summary"] : ["summary", "comments"],
+                        additionalProperties: false,
+                    },
+                },
+            },
+        ];
         try {
             console.log(`Sending diff to AI. Length: ${processedDiff.length}`);
             const completion = await this.openai.chat.completions.create({
@@ -36366,73 +36515,37 @@ ${processedDiff}
                     { role: "system", content: systemPrompt },
                     { role: "user", content: userPrompt },
                 ],
-                response_format: {
-                    type: "json_schema",
-                    json_schema: {
-                        name: "review_response",
-                        strict: true,
-                        schema: {
-                            type: "object",
-                            properties: {
-                                summary: {
-                                    type: "string",
-                                    description: "Markdown summary of the review",
-                                },
-                                comments: {
-                                    type: "array",
-                                    description: "List of inline comments",
-                                    items: {
-                                        type: "object",
-                                        properties: {
-                                            file: {
-                                                type: "string",
-                                                description: "The file path",
-                                            },
-                                            line: {
-                                                type: "number",
-                                                description: "The line number in the diff",
-                                            },
-                                            body: {
-                                                type: "string",
-                                                description: "The comment text",
-                                            },
-                                            severity: {
-                                                type: "string",
-                                                enum: ["low", "medium", "high", "critical"],
-                                                description: "Severity level of the issue",
-                                            },
-                                        },
-                                        required: ["file", "line", "body", "severity"],
-                                        additionalProperties: false,
-                                    },
-                                },
-                            },
-                            required: ["summary", "comments"],
-                            additionalProperties: false,
-                        },
-                    },
-                },
+                tools: tools,
+                tool_choice: "required", // Force the model to call at least one tool
             });
-            const content = completion.choices[0].message.content;
-            if (!content) {
-                throw new Error("Empty response from AI");
-            }
-            const response = JSON.parse(content);
-            // Validate and normalize severity levels
-            if (response.comments) {
-                const originalCount = response.comments.length;
-                response.comments = response.comments.map((comment) => ({
-                    ...comment,
-                    severity: this.normalizeSeverity(comment.severity),
-                }));
-                // Check for comments with invalid severity (normalized to 'low')
-                const invalidSeverityCount = response.comments.filter((c) => c.severity === "low").length;
-                if (invalidSeverityCount > 0) {
-                    core.warning(`Found ${invalidSeverityCount} comments with invalid severity levels, defaulting to 'low'`);
+            const response = {
+                summary: "",
+                comments: [],
+                deleteCommentIds: [],
+            };
+            const toolCalls = completion.choices[0].message.tool_calls;
+            if (toolCalls) {
+                for (const toolCall of toolCalls) {
+                    const args = JSON.parse(toolCall.function.arguments);
+                    if (toolCall.function.name === "delete_comment") {
+                        response.deleteCommentIds.push(args.comment_id);
+                    }
+                    else if (toolCall.function.name === "submit_review") {
+                        response.summary = args.summary;
+                        if (args.comments) {
+                            response.comments = args.comments.map((c) => ({
+                                ...c,
+                                severity: this.normalizeSeverity(c.severity),
+                            }));
+                        }
+                    }
                 }
-                core.info(`Processed ${originalCount} comments with severity levels`);
             }
-            console.log("AI Parsed Response:", JSON.stringify(response, null, 2));
+            // If submit_review wasn't called (unlikely with tool_choice: required, but possible if model loops on deletes), handle gracefully
+            if (!response.summary && !response.deleteCommentIds?.length) {
+                // Fallback or warning could go here, but for now we trust the model to behave
+                core.warning("AI did not submit a review summary.");
+            }
             return response;
         }
         catch (error) {
@@ -36576,6 +36689,35 @@ class GitHubService {
             pull_number: prNumber,
         });
         return comments;
+    }
+    async listBotComments(prNumber) {
+        const botUser = await this.getAuthenticatedUser();
+        const result = [];
+        // 1. Issue Comments (General)
+        const issueComments = await this.listComments(prNumber);
+        for (const comment of issueComments) {
+            if (comment.user?.login === botUser.login) {
+                result.push({
+                    id: comment.id,
+                    body: comment.body || "",
+                    type: "issue",
+                });
+            }
+        }
+        // 2. Review Comments (Inline)
+        const reviewComments = await this.listReviewComments(prNumber);
+        for (const comment of reviewComments) {
+            if (comment.user?.login === botUser.login) {
+                result.push({
+                    id: comment.id,
+                    body: comment.body,
+                    path: comment.path,
+                    line: comment.line || comment.original_line || undefined,
+                    type: "review",
+                });
+            }
+        }
+        return result;
     }
     async deleteReviewComment(commentId) {
         await this.octokit.rest.pulls.deleteReviewComment({

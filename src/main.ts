@@ -127,7 +127,24 @@ async function run(): Promise<void> {
 
     // 4. Fetch Existing Comments for Context
     core.info("Fetching existing comments...");
-    const existingComments = await githubService.listBotComments(prNumber);
+    let existingComments = await githubService.listBotComments(prNumber);
+
+    // If it's a synchronize event (new commit), clear previous comments for a fresh start
+    if (eventName === "pull_request" && payload.action === "synchronize") {
+      core.info("Synchronize event detected: Cleaning up previous reviews...");
+      for (const comment of existingComments) {
+        try {
+          if (comment.type === "issue") {
+            await githubService.deleteComment(comment.id);
+          } else {
+            await githubService.deleteReviewComment(comment.id);
+          }
+        } catch (error) {
+          core.warning(`Failed to delete comment ${comment.id}: ${error}`);
+        }
+      }
+      existingComments = [];
+    }
 
     // 5. Get AI Review
     core.info("Requesting review from AI...");
@@ -217,7 +234,7 @@ async function run(): Promise<void> {
           filteredComments.map((c) => ({
             path: c.file,
             line: c.line,
-            body: c.body,
+            body: `**[${c.severity.toUpperCase()}]** ${c.body}`,
           })),
         );
       }
