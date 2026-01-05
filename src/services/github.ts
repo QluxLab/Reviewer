@@ -70,16 +70,11 @@ export class GitHubService {
   }
 
   async getAuthenticatedUser() {
-    try {
-      const { data: user } = await this.octokit.rest.users.getAuthenticated();
-      return user;
-    } catch (error) {
-      core.debug("Could not get authenticated user (likely using GITHUB_TOKEN), falling back to github-actions[bot]");
-      return {
-        login: "github-actions[bot]",
-        id: -1,
-      } as any;
-    }
+    // Strictly return github-actions[bot] as requested
+    return {
+      login: "github-actions[bot]",
+      id: -1,
+    } as any;
   }
 
   async listComments(prNumber: number) {

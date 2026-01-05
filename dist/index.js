@@ -36073,18 +36073,35 @@ async function run() {
             // Ideally we would check if the parent comment is from the bot.
             // But for now, we'll respond if the user explicitly asks the bot or if it's in a thread the bot started.
             // Important: Avoid infinite loops. Don't reply to our own comments.
-            const currentUser = await githubService.getAuthenticatedUser();
-            if (comment.user.id === currentUser.id) {
+            // We only care about github-actions[bot] now
+            if (comment.user.login === "github-actions[bot]") {
                 return;
             }
             // We need to fetch the thread context
             const diff = await githubService.getPullRequestDiff(prNumber);
-            // Construct the comment chain
-            // Note: In a real implementation we would fetch the full thread.
-            // Here we will just use the current comment and the diff snippet if available.
-            const commentChain = `User: ${comment.body}`;
-            core.info("Generating reply to user comment...");
-            const reply = await aiService.generateReply(diff, commentChain);
+            // Fetch the full comment thread
+            core.info("Fetching comment thread for context...");
+            let threadComments = [];
+            try {
+                threadComments = await githubService.getCommentThread(prNumber, comment.id);
+            }
+            catch (error) {
+                core.warning(`Failed to fetch comment thread: ${error instanceof Error ? error.message : "Unknown error"}`);
+                // threadComments already initialized as empty array
+            }
+            // If thread fetching failed, fallback to single comment
+            if (threadComments.length === 0) {
+                threadComments = [
+                    {
+                        author: comment.user.login,
+                        body: comment.body,
+                        isBot: false,
+                    },
+                ];
+                core.info("Using fallback single comment context");
+            }
+            core.info(`Generating reply to user comment (Thread length: ${threadComments.length})...`);
+            const reply = await aiService.generateReply(diff, threadComments);
             await githubService.createReply(prNumber, comment.id, reply);
             return;
         }
@@ -36128,20 +36145,35 @@ async function run() {
         // Cleanup previous reviews
         core.info("Removing outdated comments...");
         try {
-            const currentUser = await githubService.getAuthenticatedUser();
+            // Clean up previous comments from github-actions[bot]
+            // We strictly target this bot user as requested
             // Delete Issue Comments (General comments)
             const comments = await githubService.listComments(prNumber);
             for (const comment of comments) {
-                if (comment.user?.id === currentUser.id &&
+                if (comment.user?.login === "github-actions[bot]" &&
                     !comment.body?.includes("👀 AI Review started")) {
-                    await githubService.deleteComment(comment.id);
+                    try {
+                        await githubService.deleteComment(comment.id);
+                    }
+                    catch (deleteError) {
+                        core.warning(`Failed to delete comment ${comment.id}: ${deleteError instanceof Error
+                            ? deleteError.message
+                            : "Unknown error"}`);
+                    }
                 }
             }
             // Delete Review Comments (Inline comments)
             const reviewComments = await githubService.listReviewComments(prNumber);
             for (const comment of reviewComments) {
-                if (comment.user?.id === currentUser.id) {
-                    await githubService.deleteReviewComment(comment.id);
+                if (comment.user?.login === "github-actions[bot]") {
+                    try {
+                        await githubService.deleteReviewComment(comment.id);
+                    }
+                    catch (deleteError) {
+                        core.warning(`Failed to delete review comment ${comment.id}: ${deleteError instanceof Error
+                            ? deleteError.message
+                            : "Unknown error"}`);
+                    }
                 }
             }
         }
@@ -36256,7 +36288,7 @@ class AIService {
             baseURL: config.openaiBaseUrl,
         });
     }
-    async generateReply(diff, commentChain, customInstructions) {
+    async generateReply(diff, threadComments, customInstructions) {
         const systemPrompt = `
 ${this.config.systemMessage}
 
@@ -36264,22 +36296,34 @@ You are replying to a user's comment on a code review.
 Your goal is to be helpful, clarify your previous review comments if needed, or acknowledge the user's feedback.
 Keep your response concise and professional.
 `;
-        const userPrompt = `
-${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
-
-Context (Code Diff):
-${(0, utils_1.processDiff)(diff)}
-
-Comment Chain:
-${commentChain}
-    `;
+        // Construct the threaded context
+        const processedDiff = (0, utils_1.processDiff)(diff);
+        const messages = [
+            { role: "system", content: systemPrompt },
+            {
+                role: "user",
+                content: `I am reviewing this code change:\n\n${processedDiff}`,
+            },
+        ];
+        // Add conversation history as proper messages
+        threadComments.forEach((comment) => {
+            messages.push({
+                role: comment.isBot ? "assistant" : "user",
+                content: comment.isBot
+                    ? comment.body
+                    : `${comment.author}: ${comment.body}`,
+            });
+        });
+        if (customInstructions) {
+            messages.push({
+                role: "system",
+                content: `Additional Instructions: ${customInstructions}`,
+            });
+        }
         try {
             const completion = await this.openai.chat.completions.create({
                 model: this.config.model,
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: userPrompt },
-                ],
+                messages: messages,
             });
             const content = completion.choices[0].message.content;
             if (!content) {
@@ -36296,19 +36340,6 @@ ${commentChain}
         const processedDiff = (0, utils_1.processDiff)(diff);
         const systemPrompt = `
 ${this.config.systemMessage}
-
-You must respond in valid JSON format with the following schema:
-{
-  "summary": "Markdown summary of the review",
-  "comments": [
-    {
-      "file": "filename",
-      "line": line_number_in_diff,
-      "body": "comment text",
-      "severity": "low|medium|high|critical"
-    }
-  ]
-}
 
 IMPORTANT:
 - The diff provided to you includes line numbers for each line of code.
@@ -36335,7 +36366,52 @@ ${processedDiff}
                     { role: "system", content: systemPrompt },
                     { role: "user", content: userPrompt },
                 ],
-                response_format: { type: "json_object" },
+                response_format: {
+                    type: "json_schema",
+                    json_schema: {
+                        name: "review_response",
+                        strict: true,
+                        schema: {
+                            type: "object",
+                            properties: {
+                                summary: {
+                                    type: "string",
+                                    description: "Markdown summary of the review",
+                                },
+                                comments: {
+                                    type: "array",
+                                    description: "List of inline comments",
+                                    items: {
+                                        type: "object",
+                                        properties: {
+                                            file: {
+                                                type: "string",
+                                                description: "The file path",
+                                            },
+                                            line: {
+                                                type: "number",
+                                                description: "The line number in the diff",
+                                            },
+                                            body: {
+                                                type: "string",
+                                                description: "The comment text",
+                                            },
+                                            severity: {
+                                                type: "string",
+                                                enum: ["low", "medium", "high", "critical"],
+                                                description: "Severity level of the issue",
+                                            },
+                                        },
+                                        required: ["file", "line", "body", "severity"],
+                                        additionalProperties: false,
+                                    },
+                                },
+                            },
+                            required: ["summary", "comments"],
+                            additionalProperties: false,
+                        },
+                    },
+                },
             });
             const content = completion.choices[0].message.content;
             if (!content) {
@@ -36419,6 +36495,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.GitHubService = void 0;
 const github = __importStar(__nccwpck_require__(3228));
+const core = __importStar(__nccwpck_require__(7484));
 class GitHubService {
     constructor(token) {
         this.octokit = github.getOctokit(token);
@@ -36474,8 +36551,11 @@ class GitHubService {
         return pr;
     }
     async getAuthenticatedUser() {
-        const { data: user } = await this.octokit.rest.users.getAuthenticated();
-        return user;
+        // Strictly return github-actions[bot] as requested
+        return {
+            login: "github-actions[bot]",
+            id: -1,
+        };
     }
     async listComments(prNumber) {
         const { data: comments } = await this.octokit.rest.issues.listComments({
@@ -36510,6 +36590,40 @@ class GitHubService {
             comment_id: commentId,
             body,
         });
+    }
+    async getCommentThread(prNumber, commentId) {
+        try {
+            // Fetch the specific comment to get its position in the thread
+            const { data: comment } = await this.octokit.rest.pulls.getReviewComment({
+                ...this.repo,
+                pull_number: prNumber,
+                comment_id: commentId,
+            });
+            // Get all review comments for the PR
+            const { data: allComments } = await this.octokit.rest.pulls.listReviewComments({
+                ...this.repo,
+                pull_number: prNumber,
+            });
+            // Find comments in the same thread (same file, same position, same commit)
+            const threadComments = allComments.filter(c => c.path === comment.path &&
+                c.position === comment.position &&
+                c.commit_id === comment.commit_id);
+            // Sort by created_at to get chronological order
+            threadComments.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+            // Get authenticated user to identify bot comments
+            const botUser = await this.getAuthenticatedUser();
+            // Format thread data
+            return threadComments.map(c => ({
+                author: c.user?.login || 'Unknown',
+                body: c.body,
+                isBot: c.user?.login === botUser.login
+            }));
+        }
+        catch (error) {
+            core.warning(`Failed to fetch comment thread: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            // Return empty array on failure, caller can handle gracefully
+            return [];
+        }
     }
 }
 exports.GitHubService = GitHubService;

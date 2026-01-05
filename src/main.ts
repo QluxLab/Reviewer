@@ -40,8 +40,8 @@ async function run(): Promise<void> {
       // But for now, we'll respond if the user explicitly asks the bot or if it's in a thread the bot started.
 
       // Important: Avoid infinite loops. Don't reply to our own comments.
-      const currentUser = await githubService.getAuthenticatedUser();
-      if (comment!.user.login === currentUser.login) {
+      // We only care about github-actions[bot] now
+      if (comment!.user.login === "github-actions[bot]") {
         return;
       }
 
@@ -50,26 +50,34 @@ async function run(): Promise<void> {
 
       // Fetch the full comment thread
       core.info("Fetching comment thread for context...");
-      const threadComments = await githubService.getCommentThread(prNumber, comment!.id);
+      let threadComments: Array<{author: string; body: string; isBot: boolean}> = [];
+      try {
+        threadComments = await githubService.getCommentThread(prNumber, comment!.id);
+      } catch (error) {
+        core.warning(
+          `Failed to fetch comment thread: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+        // threadComments already initialized as empty array
+      }
 
-      // Construct the comment chain with full thread context
-      let commentChain = "";
-      if (threadComments.length > 0) {
-        // Build a structured conversation history
-        commentChain = "Conversation History:\n";
-        threadComments.forEach((threadComment, index) => {
-          const authorPrefix = threadComment.isBot ? "AI Reviewer" : threadComment.author;
-          commentChain += `${index + 1}. ${authorPrefix}: ${threadComment.body}\n`;
-        });
-        core.info(`Thread context built with ${threadComments.length} comments`);
-      } else {
-        // Fallback to single comment if thread fetching failed
-        commentChain = `User: ${comment!.body}`;
+      // If thread fetching failed, fallback to single comment
+      if (threadComments.length === 0) {
+        threadComments = [
+          {
+            author: comment!.user.login,
+            body: comment!.body,
+            isBot: false,
+          },
+        ];
         core.info("Using fallback single comment context");
       }
 
-      core.info("Generating reply to user comment...");
-      const reply = await aiService.generateReply(diff, commentChain);
+      core.info(
+        `Generating reply to user comment (Thread length: ${threadComments.length})...`,
+      );
+      const reply = await aiService.generateReply(diff, threadComments);
 
       await githubService.createReply(prNumber, comment!.id, reply);
       return;
@@ -124,24 +132,45 @@ async function run(): Promise<void> {
     // Cleanup previous reviews
     core.info("Removing outdated comments...");
     try {
-      const currentUser = await githubService.getAuthenticatedUser();
+      // Clean up previous comments from github-actions[bot]
+      // We strictly target this bot user as requested
 
       // Delete Issue Comments (General comments)
       const comments = await githubService.listComments(prNumber);
       for (const comment of comments) {
         if (
-          comment.user?.login === currentUser.login &&
+          comment.user?.login === "github-actions[bot]" &&
           !comment.body?.includes("👀 AI Review started")
         ) {
-          await githubService.deleteComment(comment.id);
+          try {
+            await githubService.deleteComment(comment.id);
+          } catch (deleteError) {
+            core.warning(
+              `Failed to delete comment ${comment.id}: ${
+                deleteError instanceof Error
+                  ? deleteError.message
+                  : "Unknown error"
+              }`,
+            );
+          }
         }
       }
 
       // Delete Review Comments (Inline comments)
       const reviewComments = await githubService.listReviewComments(prNumber);
       for (const comment of reviewComments) {
-        if (comment.user?.login === currentUser.login) {
-          await githubService.deleteReviewComment(comment.id);
+        if (comment.user?.login === "github-actions[bot]") {
+          try {
+            await githubService.deleteReviewComment(comment.id);
+          } catch (deleteError) {
+            core.warning(
+              `Failed to delete review comment ${comment.id}: ${
+                deleteError instanceof Error
+                  ? deleteError.message
+                  : "Unknown error"
+              }`,
+            );
+          }
         }
       }
     } catch (error) {

@@ -29,7 +29,7 @@ export class AIService {
 
   async generateReply(
     diff: string,
-    commentChain: string,
+    threadComments: Array<{ author: string; body: string; isBot: boolean }>,
     customInstructions?: string,
   ): Promise<string> {
     const systemPrompt = `
@@ -40,23 +40,37 @@ Your goal is to be helpful, clarify your previous review comments if needed, or 
 Keep your response concise and professional.
 `;
 
-    const userPrompt = `
-${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
+    // Construct the threaded context
+    const processedDiff = processDiff(diff);
+    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      { role: "system", content: systemPrompt },
+      {
+        role: "user",
+        content: `I am reviewing this code change:\n\n${processedDiff}`,
+      },
+    ];
 
-Context (Code Diff):
-${processDiff(diff)}
+    // Add conversation history as proper messages
+    threadComments.forEach((comment) => {
+      messages.push({
+        role: comment.isBot ? "assistant" : "user",
+        content: comment.isBot
+          ? comment.body
+          : `${comment.author}: ${comment.body}`,
+      });
+    });
 
-Comment Chain:
-${commentChain}
-    `;
+    if (customInstructions) {
+      messages.push({
+        role: "system",
+        content: `Additional Instructions: ${customInstructions}`,
+      });
+    }
 
     try {
       const completion = await this.openai.chat.completions.create({
         model: this.config.model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
+        messages: messages,
       });
 
       const content = completion.choices[0].message.content;
@@ -77,19 +91,6 @@ ${commentChain}
     const processedDiff = processDiff(diff);
     const systemPrompt = `
 ${this.config.systemMessage}
-
-You must respond in valid JSON format with the following schema:
-{
-  "summary": "Markdown summary of the review",
-  "comments": [
-    {
-      "file": "filename",
-      "line": line_number_in_diff,
-      "body": "comment text",
-      "severity": "low|medium|high|critical"
-    }
-  ]
-}
 
 IMPORTANT:
 - The diff provided to you includes line numbers for each line of code.
@@ -119,7 +120,52 @@ ${processedDiff}
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
         ],
-        response_format: { type: "json_object" },
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "review_response",
+            strict: true,
+            schema: {
+              type: "object",
+              properties: {
+                summary: {
+                  type: "string",
+                  description: "Markdown summary of the review",
+                },
+                comments: {
+                  type: "array",
+                  description: "List of inline comments",
+                  items: {
+                    type: "object",
+                    properties: {
+                      file: {
+                        type: "string",
+                        description: "The file path",
+                      },
+                      line: {
+                        type: "number",
+                        description: "The line number in the diff",
+                      },
+                      body: {
+                        type: "string",
+                        description: "The comment text",
+                      },
+                      severity: {
+                        type: "string",
+                        enum: ["low", "medium", "high", "critical"],
+                        description: "Severity level of the issue",
+                      },
+                    },
+                    required: ["file", "line", "body", "severity"],
+                    additionalProperties: false,
+                  },
+                },
+              },
+              required: ["summary", "comments"],
+              additionalProperties: false,
+            },
+          },
+        },
       });
 
       const content = completion.choices[0].message.content;
