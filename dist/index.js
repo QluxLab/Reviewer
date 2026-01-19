@@ -36697,6 +36697,19 @@ class GitHubService {
         const formattedLines = lines.map(line => `> ${line}`);
         return `> [!${alertType}]\n${formattedLines.join("\n")}`;
     }
+    /**
+     * Format summary with GitHub Alert NOTE syntax
+     */
+    formatSummary(summary) {
+        // If the summary already starts with an alert, return as-is
+        if (summary.trim().startsWith("> [!")) {
+            return summary;
+        }
+        // Wrap summary in NOTE alert
+        const lines = summary.split("\n");
+        const formattedLines = lines.map(line => `> ${line}`);
+        return `> [!NOTE]\n> **AI Review Summary**\n>\n${formattedLines.join("\n")}`;
+    }
     async getPullRequestDiff(prNumber) {
         const { data: diff } = await this.octokit.rest.pulls.get({
             ...this.repo,
@@ -36724,11 +36737,13 @@ class GitHubService {
             line: c.line,
             body: this.formatInlineComment(c.body, c.severity),
         }));
+        // Format summary as NOTE alert
+        const formattedSummary = this.formatSummary(summary);
         await this.octokit.rest.pulls.createReview({
             ...this.repo,
             pull_number: prNumber,
             commit_id: commitId,
-            body: summary,
+            body: formattedSummary,
             event: "COMMENT",
             comments: formattedComments && formattedComments.length > 0 ? formattedComments : undefined,
         });
