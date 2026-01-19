@@ -36062,6 +36062,7 @@ async function run() {
                 return;
             }
             prNumber = payload.pull_request.number;
+            core.info(`📋 Processing PR #${prNumber} (${payload.action})`);
         }
         else if (eventName === "pull_request_review_comment") {
             // Handle user replies to AI comments
@@ -36070,25 +36071,23 @@ async function run() {
             const comment = payload.comment;
             const pr = payload.pull_request;
             prNumber = pr.number;
-            // Check if the reply is to a comment made by this bot or if it's just a general reply
-            // Ideally we would check if the parent comment is from the bot.
-            // But for now, we'll respond if the user explicitly asks the bot or if it's in a thread the bot started.
-            // Important: Avoid infinite loops. Don't reply to our own comments.
-            // We only care about github-actions[bot] now
+            // Avoid infinite loops - don't reply to our own comments
             if (comment.user.login === "github-actions[bot]") {
+                core.info("Skipping bot's own comment");
                 return;
             }
-            // We need to fetch the thread context
+            core.info(`💬 Processing reply in PR #${prNumber} from @${comment.user.login}`);
+            // Fetch the diff for context
             const diff = await githubService.getPullRequestDiff(prNumber);
             // Fetch the full comment thread
-            core.info("Fetching comment thread for context...");
+            core.info("🔍 Fetching comment thread for context...");
             let threadComments = [];
             try {
                 threadComments = await githubService.getCommentThread(prNumber, comment.id);
+                core.info(`📜 Found ${threadComments.length} messages in thread`);
             }
             catch (error) {
                 core.warning(`Failed to fetch comment thread: ${error instanceof Error ? error.message : "Unknown error"}`);
-                // threadComments already initialized as empty array
             }
             // If thread fetching failed, fallback to single comment
             if (threadComments.length === 0) {
@@ -36101,9 +36100,10 @@ async function run() {
                 ];
                 core.info("Using fallback single comment context");
             }
-            core.info(`Generating reply to user comment (Thread length: ${threadComments.length})...`);
+            core.info("🤖 Generating AI reply...");
             const reply = await aiService.generateReply(diff, threadComments);
             await githubService.createReply(prNumber, comment.id, reply);
+            core.info("✅ Reply posted successfully");
             return;
         }
         else if (eventName === "issue_comment") {
@@ -36122,6 +36122,10 @@ async function run() {
             }
             prNumber = payload.issue.number;
             customInstructions = instructions;
+            core.info(`🎯 Manual review requested for PR #${prNumber}`);
+            if (customInstructions) {
+                core.info(`📝 Custom instructions: ${customInstructions.substring(0, 100)}...`);
+            }
             // Post a reaction to acknowledge the command
             await githubService.postComment(prNumber, "👀 AI Review started...");
         }
@@ -36130,49 +36134,39 @@ async function run() {
             return;
         }
         // 2. Fetch Changed Files & Filter Ignored
+        core.info("📂 Fetching changed files...");
         const changedFiles = await githubService.getChangedFiles(prNumber);
+        core.info(`Found ${changedFiles.length} changed files`);
         const filesToReview = changedFiles.filter((file) => !(0, utils_1.isFileIgnored)(file, config.ignorePatterns));
+        const ignoredCount = changedFiles.length - filesToReview.length;
+        if (ignoredCount > 0) {
+            core.info(`🚫 Ignored ${ignoredCount} files based on patterns`);
+        }
         if (filesToReview.length === 0) {
             core.info("No files to review after filtering.");
+            await githubService.postComment(prNumber, "ℹ️ No files to review (all files are in ignore patterns).");
             return;
         }
+        core.info(`✅ Reviewing ${filesToReview.length} files`);
         // 3. Fetch Diff
+        core.info("📥 Fetching PR diff...");
         const diff = await githubService.getPullRequestDiff(prNumber);
-        // TODO: Improve diff handling for very large PRs (truncation or chunking)
-        // For now, we pass the raw diff.
+        core.info(`📊 Diff size: ${diff.length} characters`);
         // 4. Fetch Existing Comments for Context
-        core.info("Fetching existing comments...");
-        let existingComments = await githubService.listBotComments(prNumber);
-        // If it's a synchronize event (new commit), clear previous comments for a fresh start
+        core.info("💬 Fetching existing bot comments...");
+        const existingComments = await githubService.listBotComments(prNumber);
+        // If it's a synchronize event (new commit), we keep existing comments for context
         if (eventName === "pull_request" && payload.action === "synchronize") {
-            core.info("Synchronize event detected: Cleaning up previous reviews...");
-            for (const comment of existingComments) {
-                try {
-                    if (comment.type === "issue") {
-                        await githubService.deleteComment(comment.id);
-                    }
-                    else {
-                        await githubService.deleteReviewComment(comment.id);
-                    }
-                }
-                catch (error) {
-                    core.warning(`Failed to delete comment ${comment.id}: ${error}`);
-                }
-            }
-            existingComments = [];
+            core.info("🔄 Synchronize event: Using existing comments for consistency and deduplication");
         }
         // 5. Get AI Review
-        core.info("Requesting review from AI...");
+        core.info("🤖 Requesting review from AI...");
         const review = await aiService.getReview(diff, existingComments, customInstructions);
         // 6. Delete Outdated Comments (as requested by AI)
         if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
-            core.info(`Deleting ${review.deleteCommentIds.length} outdated comments...`);
+            core.info(`🗑️  Deleting ${review.deleteCommentIds.length} outdated comments...`);
             for (const commentId of review.deleteCommentIds) {
                 try {
-                    // Try deleting as general comment first, then review comment if fails?
-                    // Actually, we should know the type, but listBotComments aggregates them.
-                    // Since the ID is unique across both (in GitHub API mostly, but safer to try both or lookup),
-                    // let's look up the type from our existingComments list for efficiency.
                     const commentInfo = existingComments.find(c => c.id === commentId);
                     if (commentInfo) {
                         if (commentInfo.type === 'issue') {
@@ -36181,15 +36175,17 @@ async function run() {
                         else {
                             await githubService.deleteReviewComment(commentId);
                         }
+                        core.info(`  ✓ Deleted ${commentInfo.type} comment #${commentId}`);
                     }
                     else {
-                        // Fallback if not found in our cache (unlikely)
-                        // Try review comment first as they are more common in reviews
+                        // Fallback if not found in our cache
                         try {
                             await githubService.deleteReviewComment(commentId);
+                            core.info(`  ✓ Deleted review comment #${commentId}`);
                         }
                         catch {
                             await githubService.deleteComment(commentId);
+                            core.info(`  ✓ Deleted issue comment #${commentId}`);
                         }
                     }
                 }
@@ -36198,52 +36194,60 @@ async function run() {
                 }
             }
         }
-        // 7. Post Summary
-        if (review.summary) {
-            await githubService.postComment(prNumber, `## AI Review Summary\n\n${review.summary}`);
+        // 7. Post Review with Summary and Inline Comments
+        const validComments = review.comments?.filter((c) => filesToReview.includes(c.file)) || [];
+        // Filter comments based on severity
+        const minSeverityLevel = (0, utils_1.getSeverityLevel)(config.minSeverity);
+        const filteredComments = validComments.filter((c) => (0, utils_1.getSeverityLevel)(c.severity) >= minSeverityLevel);
+        // Log filtering results
+        const filteredCount = validComments.length - filteredComments.length;
+        if (filteredCount > 0) {
+            core.info(`⚠️  Filtered ${filteredCount} comments below ${config.minSeverity} severity level`);
         }
-        // 8. Post Inline Comments
-        if (review.comments && review.comments.length > 0) {
-            const validComments = review.comments.filter((c) => filesToReview.includes(c.file));
-            // Filter comments based on severity
-            const minSeverityLevel = (0, utils_1.getSeverityLevel)(config.minSeverity);
-            const filteredComments = validComments.filter((c) => (0, utils_1.getSeverityLevel)(c.severity) >= minSeverityLevel);
-            // Log filtering results
-            const filteredCount = validComments.length - filteredComments.length;
-            if (filteredCount > 0) {
-                core.info(`Filtered ${filteredCount} comments below ${config.minSeverity} severity level`);
-                core.info(`Posting ${filteredComments.length} comments meeting ${config.minSeverity} severity or higher`);
-            }
-            else {
-                core.info(`All ${validComments.length} comments meet ${config.minSeverity} severity level or higher`);
-            }
-            // Log severity distribution for debugging
-            const severityCounts = {
-                low: 0,
-                medium: 0,
-                high: 0,
-                critical: 0,
-            };
-            validComments.forEach((c) => {
-                severityCounts[c.severity]++;
-            });
-            core.debug(`Severity distribution: ${JSON.stringify(severityCounts)}`);
-            if (filteredComments.length > 0) {
-                await githubService.createReview(prNumber, filteredComments.map((c) => ({
-                    path: c.file,
-                    line: c.line,
-                    body: `**[${c.severity.toUpperCase()}]** ${c.body}`,
-                })));
-            }
+        // Log severity distribution
+        const severityCounts = {
+            low: 0,
+            medium: 0,
+            high: 0,
+            critical: 0,
+        };
+        validComments.forEach((c) => {
+            severityCounts[c.severity]++;
+        });
+        core.info(`📊 Severity distribution: ${JSON.stringify(severityCounts)}`);
+        if (filteredComments.length > 0) {
+            core.info(`💡 Posting ${filteredComments.length} inline comments (${config.minSeverity}+ severity)`);
         }
-        core.info("Review completed successfully.");
+        // Get PR head SHA for the review
+        const commitId = await githubService.getPRHeadSHA(prNumber);
+        // Convert comments from AIReviewResponse format to GitHubService format
+        // AIReviewResponse uses 'file', but createReview expects 'path'
+        const formattedComments = filteredComments.map(c => ({
+            path: c.file, // Изменение: file -> path
+            line: c.line,
+            body: c.body,
+            severity: c.severity
+        }));
+        // Post the complete review (summary + inline comments)
+        await githubService.createReview(prNumber, commitId, review.summary, config.disableInline ? undefined : formattedComments);
+        // Summary of the review
+        core.info("✅ Review completed successfully!");
+        core.info(`📋 Summary length: ${review.summary.length} characters`);
+        core.info(`💬 Inline comments posted: ${filteredComments.length}`);
+        core.info(`🗑️  Comments deleted: ${review.deleteCommentIds?.length || 0}`);
+        // Set outputs for workflow
+        core.setOutput("summary", review.summary);
+        core.setOutput("comments_count", filteredComments.length);
+        core.setOutput("deleted_comments_count", review.deleteCommentIds?.length || 0);
+        core.setOutput("severity_distribution", JSON.stringify(severityCounts));
     }
     catch (error) {
         if (error instanceof Error) {
-            core.setFailed(error.message);
+            core.setFailed(`❌ ${error.message}`);
+            core.error(error.stack || "No stack trace available");
         }
         else {
-            core.setFailed("An unknown error occurred");
+            core.setFailed("❌ An unknown error occurred");
         }
     }
 }
@@ -36356,6 +36360,8 @@ Keep your response concise and professional.
     }
     async getReview(diff, existingComments, customInstructions) {
         const processedDiff = (0, utils_1.processDiff)(diff);
+        // Separate active review comments (bot's previous reviews) from other comments
+        const previousReviews = existingComments.filter((c) => c.type === "review" && !c.isOutdated);
         const systemPrompt = `
 ## Role
 
@@ -36396,17 +36402,38 @@ Analyze the selected code for:
 
 ## Output Format
 
-Provide feedback as:
+**For the main summary:**
+Provide a brief, high-level overview of what this PR does and your overall assessment. Keep it concise (2-4 sentences). DO NOT include detailed issues or suggestions here - those go in inline comments.
 
-**🔴 Critical Issues** - Must fix before merge
-**🟡 Suggestions** - Improvements to consider
-**✅ Good Practices** - What's done well
+Example:
+"This PR implements user authentication using JWT tokens. The overall approach is solid, but there are some security concerns and performance optimizations that should be addressed before merging."
 
-For each issue:
-- Specific line references
-- Clear explanation of the problem
-- Suggested solution with code example
-- Rationale for the change
+**For inline comments:**
+Use GitHub Alert syntax to categorize your feedback by severity:
+
+- **> [!CAUTION]** - Critical security issues or bugs that must be fixed before merge
+- **> [!WARNING]** - Important issues that should be addressed (performance problems, design flaws)
+- **> [!IMPORTANT]** - Significant improvements that are strongly recommended
+- **> [!TIP]** - Helpful suggestions for better code quality or maintainability
+- **> [!NOTE]** - Minor observations, good practices spotted, or informational comments
+
+For each inline comment:
+- Start with the appropriate alert syntax
+- Provide a clear explanation of the issue/suggestion
+- Include a code example if applicable
+- Explain the rationale
+
+Example inline comment:
+\`\`\`
+> [!CAUTION]
+> SQL injection vulnerability detected. User input is directly interpolated into the query string.
+> 
+> Replace with parameterized query:
+> \`\`\`javascript
+> db.query('SELECT * FROM users WHERE id = ?', [userId])
+> \`\`\`
+> This prevents malicious SQL from being executed.
+\`\`\`
 
 Focus on: ${customInstructions || "General code improvements and best practices"}
 
@@ -36416,13 +36443,32 @@ IMPORTANT IMPLEMENTATION DETAILS:
 - The diff provided to you includes line numbers for each line of code.
 - Only comment on lines that are changed in the diff (lines starting with '+').
 - Use the available tools to submit the review.
-- For inline comments (using the 'comments' tool parameter), map the severity as follows:
-  - **🔴 Critical Issues** -> 'critical' or 'high'
-  - **🟡 Suggestions** -> 'medium' or 'low'
-- Use the **Output Format** guidelines above to structure your 'summary' field.
+- For inline comments (using the 'comments' tool parameter), map the GitHub Alert to severity as follows:
+  - **> [!CAUTION]** -> 'critical'
+  - **> [!WARNING]** -> 'high'
+  - **> [!IMPORTANT]** -> 'medium'
+  - **> [!TIP]** -> 'low'
+  - **> [!NOTE]** -> 'low'
+- Always start inline comment body with the appropriate alert syntax (e.g., "> [!CAUTION]")
 - Be precise and confident in your feedback. Avoid vague language.
 - Directly state the issue and the solution.
 - You can delete your old comments if they are no longer relevant (e.g., the issue was fixed).
+
+IMPORTANT - COMMENT MANAGEMENT:
+- You are provided with a list of "existing comments" on the PR.
+- Some comments are marked as 'isOutdated: true'. This means they were made on a previous commit and the code line has since changed.
+- GitHub automatically collapses these outdated comments.
+- DO NOT report the same issue again if it was already reported in an outdated comment, UNLESS the issue persists in the new code.
+- If an issue persists, you SHOULD report it again on the new line.
+- Do NOT delete outdated comments using 'delete_comment' unless you made a mistake and the comment was never valid. Let GitHub handle the history.
+- EXISTING ACTIVE COMMENTS (isOutdated: false): Do NOT report these again. We want to avoid duplicate comments on the same line.
+
+CONSISTENCY WITH PREVIOUS REVIEWS:
+- You have access to your previous review comments below.
+- Maintain consistency with your previous feedback - don't contradict yourself.
+- If you previously recommended a pattern/approach, don't suggest the opposite now unless the context has significantly changed.
+- If the developer addressed your previous comment, acknowledge it and don't repeat the same issue.
+- Build upon your previous reviews - if you see the same pattern elsewhere, reference your earlier feedback.
 `;
         const userPrompt = `
 ${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
@@ -36432,6 +36478,13 @@ ${processedDiff}
 
 Here are your existing comments on this PR:
 ${JSON.stringify(existingComments, null, 2)}
+
+${previousReviews.length > 0 ? `
+YOUR PREVIOUS REVIEW COMMENTS (for context and consistency):
+${previousReviews.map((c) => `[${c.path}:${c.line}] ${c.body}`).join("\n\n")}
+
+Remember to stay consistent with your previous feedback.
+` : ""}
 
 Use the available tools to submit your review and manage comments.
     `;
@@ -36459,20 +36512,20 @@ Use the available tools to submit your review and manage comments.
                 type: "function",
                 function: {
                     name: "submit_review",
-                    description: "Submit the code review with a summary and optional inline comments.",
+                    description: "Submit the code review with a summary and optional inline comments. The summary should be a brief overview of the PR (2-4 sentences). Detailed feedback goes in inline comments using GitHub Alert syntax.",
                     parameters: {
                         type: "object",
                         properties: {
                             summary: {
                                 type: "string",
-                                description: "Markdown summary of the review",
+                                description: "Brief markdown summary of what this PR does and overall assessment (2-4 sentences). DO NOT include detailed issues here.",
                             },
                             // Only include 'comments' field if inline comments are NOT disabled
                             ...(!this.config.disableInline
                                 ? {
                                     comments: {
                                         type: "array",
-                                        description: "List of inline comments",
+                                        description: "List of inline comments using GitHub Alert syntax",
                                         items: {
                                             type: "object",
                                             properties: {
@@ -36486,12 +36539,12 @@ Use the available tools to submit your review and manage comments.
                                                 },
                                                 body: {
                                                     type: "string",
-                                                    description: "The comment text",
+                                                    description: "The comment text starting with GitHub Alert syntax (e.g., '> [!CAUTION]\\n> Description...')",
                                                 },
                                                 severity: {
                                                     type: "string",
                                                     enum: ["low", "medium", "high", "critical"],
-                                                    description: "Severity level of the issue",
+                                                    description: "Severity level: 'critical' for CAUTION, 'high' for WARNING, 'medium' for IMPORTANT, 'low' for TIP/NOTE",
                                                 },
                                             },
                                             required: ["file", "line", "body", "severity"],
@@ -36617,6 +36670,33 @@ class GitHubService {
     get repo() {
         return this.context.repo;
     }
+    /**
+     * Map severity to GitHub Alert type
+     */
+    getAlertType(severity) {
+        const alertMap = {
+            critical: "CAUTION",
+            high: "WARNING",
+            medium: "IMPORTANT",
+            low: "TIP",
+        };
+        return alertMap[severity] || "NOTE";
+    }
+    /**
+     * Format inline comment body with GitHub Alert syntax
+     */
+    formatInlineComment(body, severity) {
+        // If the body already starts with an alert, return as-is
+        if (body.trim().startsWith("> [!")) {
+            return body;
+        }
+        // Otherwise, wrap it in the appropriate alert based on severity
+        const alertType = this.getAlertType(severity);
+        // Split body into lines and format each line with quote syntax
+        const lines = body.split("\n");
+        const formattedLines = lines.map(line => `> ${line}`);
+        return `> [!${alertType}]\n${formattedLines.join("\n")}`;
+    }
     async getPullRequestDiff(prNumber) {
         const { data: diff } = await this.octokit.rest.pulls.get({
             ...this.repo,
@@ -36635,19 +36715,24 @@ class GitHubService {
             body,
         });
     }
-    async createReview(prNumber, comments) {
-        if (comments.length === 0)
-            return;
+    /**
+     * Create a review with summary and optional inline comments
+     */
+    async createReview(prNumber, commitId, summary, comments) {
+        const formattedComments = comments?.map((c) => ({
+            path: c.path,
+            line: c.line,
+            body: this.formatInlineComment(c.body, c.severity),
+        }));
         await this.octokit.rest.pulls.createReview({
             ...this.repo,
             pull_number: prNumber,
+            commit_id: commitId,
+            body: summary,
             event: "COMMENT",
-            comments: comments.map((c) => ({
-                path: c.path,
-                line: c.line,
-                body: c.body,
-            })),
+            comments: formattedComments && formattedComments.length > 0 ? formattedComments : undefined,
         });
+        core.info(`Review posted with summary and ${formattedComments?.length || 0} inline comments`);
     }
     async getChangedFiles(prNumber) {
         const { data: files } = await this.octokit.rest.pulls.listFiles({
@@ -36678,10 +36763,16 @@ class GitHubService {
         return comments;
     }
     async deleteComment(commentId) {
-        await this.octokit.rest.issues.deleteComment({
-            ...this.repo,
-            comment_id: commentId,
-        });
+        try {
+            await this.octokit.rest.issues.deleteComment({
+                ...this.repo,
+                comment_id: commentId,
+            });
+            core.info(`Deleted issue comment ${commentId}`);
+        }
+        catch (error) {
+            core.warning(`Failed to delete issue comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
     }
     async listReviewComments(prNumber) {
         const { data: comments } = await this.octokit.rest.pulls.listReviewComments({
@@ -36694,6 +36785,7 @@ class GitHubService {
         const botUser = await this.getAuthenticatedUser();
         const result = [];
         // 1. Issue Comments (General)
+        // Issue comments are generally "active" unless manually minimized, but we treat them as active here.
         const issueComments = await this.listComments(prNumber);
         for (const comment of issueComments) {
             if (comment.user?.login === botUser.login) {
@@ -36701,6 +36793,7 @@ class GitHubService {
                     id: comment.id,
                     body: comment.body || "",
                     type: "issue",
+                    isOutdated: false,
                 });
             }
         }
@@ -36708,22 +36801,55 @@ class GitHubService {
         const reviewComments = await this.listReviewComments(prNumber);
         for (const comment of reviewComments) {
             if (comment.user?.login === botUser.login) {
+                // A review comment is outdated if it has no position in the current diff
+                const isOutdated = comment.position === null;
                 result.push({
                     id: comment.id,
                     body: comment.body,
                     path: comment.path,
                     line: comment.line || comment.original_line || undefined,
                     type: "review",
+                    isOutdated,
                 });
             }
         }
+        core.info(`Found ${result.length} bot comments (${result.filter(c => !c.isOutdated).length} active, ${result.filter(c => c.isOutdated).length} outdated)`);
         return result;
     }
     async deleteReviewComment(commentId) {
-        await this.octokit.rest.pulls.deleteReviewComment({
-            ...this.repo,
-            comment_id: commentId,
-        });
+        try {
+            await this.octokit.rest.pulls.deleteReviewComment({
+                ...this.repo,
+                comment_id: commentId,
+            });
+            core.info(`Deleted review comment ${commentId}`);
+        }
+        catch (error) {
+            core.warning(`Failed to delete review comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+    /**
+     * Delete multiple comments (both issue and review comments)
+     */
+    async deleteComments(commentIds, prNumber) {
+        if (commentIds.length === 0) {
+            return;
+        }
+        core.info(`Deleting ${commentIds.length} comments...`);
+        const allComments = await this.listBotComments(prNumber);
+        for (const commentId of commentIds) {
+            const comment = allComments.find(c => c.id === commentId);
+            if (!comment) {
+                core.warning(`Comment ${commentId} not found, skipping deletion`);
+                continue;
+            }
+            if (comment.type === "issue") {
+                await this.deleteComment(commentId);
+            }
+            else {
+                await this.deleteReviewComment(commentId);
+            }
+        }
     }
     async createReply(prNumber, commentId, body) {
         await this.octokit.rest.pulls.createReplyForReviewComment({
@@ -36746,10 +36872,21 @@ class GitHubService {
                 ...this.repo,
                 pull_number: prNumber,
             });
-            // Find comments in the same thread (same file, same position, same commit)
-            const threadComments = allComments.filter(c => c.path === comment.path &&
-                c.position === comment.position &&
-                c.commit_id === comment.commit_id);
+            // Find comments in the same thread
+            // GitHub uses in_reply_to_id to link replies
+            const threadComments = [];
+            // Find the root comment (the one without in_reply_to_id or the original comment)
+            let rootComment = comment;
+            if (comment.in_reply_to_id) {
+                const root = allComments.find(c => c.id === comment.in_reply_to_id);
+                if (root)
+                    rootComment = root;
+            }
+            // Add root comment
+            threadComments.push(rootComment);
+            // Find all replies to this root comment
+            const replies = allComments.filter(c => c.in_reply_to_id === rootComment.id);
+            threadComments.push(...replies);
             // Sort by created_at to get chronological order
             threadComments.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
             // Get authenticated user to identify bot comments
@@ -36766,6 +36903,13 @@ class GitHubService {
             // Return empty array on failure, caller can handle gracefully
             return [];
         }
+    }
+    /**
+     * Get commit SHA for the PR head
+     */
+    async getPRHeadSHA(prNumber) {
+        const pr = await this.getPRDetails(prNumber);
+        return pr.head.sha;
     }
 }
 exports.GitHubService = GitHubService;

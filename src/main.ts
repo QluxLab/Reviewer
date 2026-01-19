@@ -27,6 +27,7 @@ async function run(): Promise<void> {
         return;
       }
       prNumber = payload.pull_request!.number;
+      core.info(`📋 Processing PR #${prNumber} (${payload.action})`);
     } else if (eventName === "pull_request_review_comment") {
       // Handle user replies to AI comments
       if (payload.action !== "created") return;
@@ -35,31 +36,28 @@ async function run(): Promise<void> {
       const pr = payload.pull_request;
       prNumber = pr!.number;
 
-      // Check if the reply is to a comment made by this bot or if it's just a general reply
-      // Ideally we would check if the parent comment is from the bot.
-      // But for now, we'll respond if the user explicitly asks the bot or if it's in a thread the bot started.
-
-      // Important: Avoid infinite loops. Don't reply to our own comments.
-      // We only care about github-actions[bot] now
+      // Avoid infinite loops - don't reply to our own comments
       if (comment!.user.login === "github-actions[bot]") {
+        core.info("Skipping bot's own comment");
         return;
       }
 
-      // We need to fetch the thread context
+      core.info(`💬 Processing reply in PR #${prNumber} from @${comment!.user.login}`);
+
+      // Fetch the diff for context
       const diff = await githubService.getPullRequestDiff(prNumber);
 
       // Fetch the full comment thread
-      core.info("Fetching comment thread for context...");
-      let threadComments: Array<{author: string; body: string; isBot: boolean}> = [];
+      core.info("🔍 Fetching comment thread for context...");
+      let threadComments: Array<{ author: string; body: string; isBot: boolean }> = [];
       try {
         threadComments = await githubService.getCommentThread(prNumber, comment!.id);
+        core.info(`📜 Found ${threadComments.length} messages in thread`);
       } catch (error) {
         core.warning(
-          `Failed to fetch comment thread: ${
-            error instanceof Error ? error.message : "Unknown error"
+          `Failed to fetch comment thread: ${error instanceof Error ? error.message : "Unknown error"
           }`
         );
-        // threadComments already initialized as empty array
       }
 
       // If thread fetching failed, fallback to single comment
@@ -74,12 +72,11 @@ async function run(): Promise<void> {
         core.info("Using fallback single comment context");
       }
 
-      core.info(
-        `Generating reply to user comment (Thread length: ${threadComments.length})...`,
-      );
+      core.info("🤖 Generating AI reply...");
       const reply = await aiService.generateReply(diff, threadComments);
 
       await githubService.createReply(prNumber, comment!.id, reply);
+      core.info("✅ Reply posted successfully");
       return;
     } else if (eventName === "issue_comment") {
       if (payload.action !== "created") return;
@@ -101,6 +98,11 @@ async function run(): Promise<void> {
       prNumber = payload.issue!.number;
       customInstructions = instructions;
 
+      core.info(`🎯 Manual review requested for PR #${prNumber}`);
+      if (customInstructions) {
+        core.info(`📝 Custom instructions: ${customInstructions.substring(0, 100)}...`);
+      }
+
       // Post a reaction to acknowledge the command
       await githubService.postComment(prNumber, "👀 AI Review started...");
     } else {
@@ -109,143 +111,149 @@ async function run(): Promise<void> {
     }
 
     // 2. Fetch Changed Files & Filter Ignored
+    core.info("📂 Fetching changed files...");
     const changedFiles = await githubService.getChangedFiles(prNumber);
+    core.info(`Found ${changedFiles.length} changed files`);
+
     const filesToReview = changedFiles.filter(
       (file) => !isFileIgnored(file, config.ignorePatterns),
     );
 
+    const ignoredCount = changedFiles.length - filesToReview.length;
+    if (ignoredCount > 0) {
+      core.info(`🚫 Ignored ${ignoredCount} files based on patterns`);
+    }
+
     if (filesToReview.length === 0) {
       core.info("No files to review after filtering.");
+      await githubService.postComment(
+        prNumber,
+        "ℹ️ No files to review (all files are in ignore patterns)."
+      );
       return;
     }
 
-    // 3. Fetch Diff
-    const diff = await githubService.getPullRequestDiff(prNumber);
+    core.info(`✅ Reviewing ${filesToReview.length} files`);
 
-    // TODO: Improve diff handling for very large PRs (truncation or chunking)
-    // For now, we pass the raw diff.
+    // 3. Fetch Diff
+    core.info("📥 Fetching PR diff...");
+    const diff = await githubService.getPullRequestDiff(prNumber);
+    core.info(`📊 Diff size: ${diff.length} characters`);
 
     // 4. Fetch Existing Comments for Context
-    core.info("Fetching existing comments...");
-    let existingComments = await githubService.listBotComments(prNumber);
+    core.info("💬 Fetching existing bot comments...");
+    const existingComments = await githubService.listBotComments(prNumber);
 
-    // If it's a synchronize event (new commit), clear previous comments for a fresh start
+    // If it's a synchronize event (new commit), we keep existing comments for context
     if (eventName === "pull_request" && payload.action === "synchronize") {
-      core.info("Synchronize event detected: Cleaning up previous reviews...");
-      for (const comment of existingComments) {
-        try {
-          if (comment.type === "issue") {
-            await githubService.deleteComment(comment.id);
-          } else {
-            await githubService.deleteReviewComment(comment.id);
-          }
-        } catch (error) {
-          core.warning(`Failed to delete comment ${comment.id}: ${error}`);
-        }
-      }
-      existingComments = [];
+      core.info("🔄 Synchronize event: Using existing comments for consistency and deduplication");
     }
 
     // 5. Get AI Review
-    core.info("Requesting review from AI...");
+    core.info("🤖 Requesting review from AI...");
     const review = await aiService.getReview(diff, existingComments, customInstructions);
 
     // 6. Delete Outdated Comments (as requested by AI)
     if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
-      core.info(`Deleting ${review.deleteCommentIds.length} outdated comments...`);
+      core.info(`🗑️  Deleting ${review.deleteCommentIds.length} outdated comments...`);
+
       for (const commentId of review.deleteCommentIds) {
         try {
-          // Try deleting as general comment first, then review comment if fails?
-          // Actually, we should know the type, but listBotComments aggregates them.
-          // Since the ID is unique across both (in GitHub API mostly, but safer to try both or lookup),
-          // let's look up the type from our existingComments list for efficiency.
           const commentInfo = existingComments.find(c => c.id === commentId);
           if (commentInfo) {
             if (commentInfo.type === 'issue') {
-               await githubService.deleteComment(commentId);
+              await githubService.deleteComment(commentId);
             } else {
-               await githubService.deleteReviewComment(commentId);
+              await githubService.deleteReviewComment(commentId);
             }
+            core.info(`  ✓ Deleted ${commentInfo.type} comment #${commentId}`);
           } else {
-             // Fallback if not found in our cache (unlikely)
-             // Try review comment first as they are more common in reviews
-             try {
-                await githubService.deleteReviewComment(commentId);
-             } catch {
-                await githubService.deleteComment(commentId);
-             }
+            // Fallback if not found in our cache
+            try {
+              await githubService.deleteReviewComment(commentId);
+              core.info(`  ✓ Deleted review comment #${commentId}`);
+            } catch {
+              await githubService.deleteComment(commentId);
+              core.info(`  ✓ Deleted issue comment #${commentId}`);
+            }
           }
         } catch (error) {
-           core.warning(`Failed to delete comment ${commentId}: ${error}`);
+          core.warning(`Failed to delete comment ${commentId}: ${error}`);
         }
       }
     }
 
-    // 7. Post Summary
-    if (review.summary) {
-      await githubService.postComment(
-        prNumber,
-        `## AI Review Summary\n\n${review.summary}`,
-      );
+    // 7. Post Review with Summary and Inline Comments
+    const validComments = review.comments?.filter((c) =>
+      filesToReview.includes(c.file),
+    ) || [];
+
+    // Filter comments based on severity
+    const minSeverityLevel = getSeverityLevel(config.minSeverity);
+    const filteredComments = validComments.filter(
+      (c) => getSeverityLevel(c.severity) >= minSeverityLevel,
+    );
+
+    // Log filtering results
+    const filteredCount = validComments.length - filteredComments.length;
+    if (filteredCount > 0) {
+      core.info(`⚠️  Filtered ${filteredCount} comments below ${config.minSeverity} severity level`);
     }
 
-    // 8. Post Inline Comments
-    if (review.comments && review.comments.length > 0) {
-      const validComments = review.comments.filter((c) =>
-        filesToReview.includes(c.file),
-      );
+    // Log severity distribution
+    const severityCounts: Record<SeverityLevel, number> = {
+      low: 0,
+      medium: 0,
+      high: 0,
+      critical: 0,
+    };
+    validComments.forEach((c) => {
+      severityCounts[c.severity]++;
+    });
+    core.info(`📊 Severity distribution: ${JSON.stringify(severityCounts)}`);
 
-      // Filter comments based on severity
-      const minSeverityLevel = getSeverityLevel(config.minSeverity);
-      const filteredComments = validComments.filter(
-        (c) => getSeverityLevel(c.severity) >= minSeverityLevel,
-      );
-
-      // Log filtering results
-      const filteredCount = validComments.length - filteredComments.length;
-      if (filteredCount > 0) {
-        core.info(
-          `Filtered ${filteredCount} comments below ${config.minSeverity} severity level`,
-        );
-        core.info(
-          `Posting ${filteredComments.length} comments meeting ${config.minSeverity} severity or higher`,
-        );
-      } else {
-        core.info(
-          `All ${validComments.length} comments meet ${config.minSeverity} severity level or higher`,
-        );
-      }
-
-      // Log severity distribution for debugging
-      const severityCounts: Record<SeverityLevel, number> = {
-        low: 0,
-        medium: 0,
-        high: 0,
-        critical: 0,
-      };
-      validComments.forEach((c) => {
-        severityCounts[c.severity]++;
-      });
-      core.debug(`Severity distribution: ${JSON.stringify(severityCounts)}`);
-
-      if (filteredComments.length > 0) {
-        await githubService.createReview(
-          prNumber,
-          filteredComments.map((c) => ({
-            path: c.file,
-            line: c.line,
-            body: `**[${c.severity.toUpperCase()}]** ${c.body}`,
-          })),
-        );
-      }
+    if (filteredComments.length > 0) {
+      core.info(`💡 Posting ${filteredComments.length} inline comments (${config.minSeverity}+ severity)`);
     }
 
-    core.info("Review completed successfully.");
+    // Get PR head SHA for the review
+    const commitId = await githubService.getPRHeadSHA(prNumber);
+
+    // Convert comments from AIReviewResponse format to GitHubService format
+    // AIReviewResponse uses 'file', but createReview expects 'path'
+    const formattedComments = filteredComments.map(c => ({
+      path: c.file, // Изменение: file -> path
+      line: c.line,
+      body: c.body,
+      severity: c.severity
+    }));
+
+    // Post the complete review (summary + inline comments)
+    await githubService.createReview(
+      prNumber,
+      commitId,
+      review.summary,
+      config.disableInline ? undefined : formattedComments
+    );
+
+    // Summary of the review
+    core.info("✅ Review completed successfully!");
+    core.info(`📋 Summary length: ${review.summary.length} characters`);
+    core.info(`💬 Inline comments posted: ${filteredComments.length}`);
+    core.info(`🗑️  Comments deleted: ${review.deleteCommentIds?.length || 0}`);
+
+    // Set outputs for workflow
+    core.setOutput("summary", review.summary);
+    core.setOutput("comments_count", filteredComments.length);
+    core.setOutput("deleted_comments_count", review.deleteCommentIds?.length || 0);
+    core.setOutput("severity_distribution", JSON.stringify(severityCounts));
+
   } catch (error) {
     if (error instanceof Error) {
-      core.setFailed(error.message);
+      core.setFailed(`❌ ${error.message}`);
+      core.error(error.stack || "No stack trace available");
     } else {
-      core.setFailed("An unknown error occurred");
+      core.setFailed("❌ An unknown error occurred");
     }
   }
 }

@@ -1,6 +1,7 @@
 import * as github from "@actions/github";
 import * as core from "@actions/core";
 import { GitHub } from "@actions/github/lib/utils";
+import { SeverityLevel } from "./ai";
 
 export class GitHubService {
   private octokit: InstanceType<typeof GitHub>;
@@ -13,6 +14,38 @@ export class GitHubService {
 
   get repo() {
     return this.context.repo;
+  }
+
+  /**
+   * Map severity to GitHub Alert type
+   */
+  private getAlertType(severity: SeverityLevel): string {
+    const alertMap: Record<SeverityLevel, string> = {
+      critical: "CAUTION",
+      high: "WARNING",
+      medium: "IMPORTANT",
+      low: "TIP",
+    };
+    return alertMap[severity] || "NOTE";
+  }
+
+  /**
+   * Format inline comment body with GitHub Alert syntax
+   */
+  private formatInlineComment(body: string, severity: SeverityLevel): string {
+    // If the body already starts with an alert, return as-is
+    if (body.trim().startsWith("> [!")) {
+      return body;
+    }
+
+    // Otherwise, wrap it in the appropriate alert based on severity
+    const alertType = this.getAlertType(severity);
+
+    // Split body into lines and format each line with quote syntax
+    const lines = body.split("\n");
+    const formattedLines = lines.map(line => `> ${line}`);
+
+    return `> [!${alertType}]\n${formattedLines.join("\n")}`;
   }
 
   async getPullRequestDiff(prNumber: number): Promise<string> {
@@ -35,22 +68,33 @@ export class GitHubService {
     });
   }
 
+  /**
+   * Create a review with summary and optional inline comments
+   */
   async createReview(
     prNumber: number,
-    comments: Array<{ path: string; line: number; body: string }>,
+    commitId: string,
+    summary: string,
+    comments?: Array<{ path: string; line: number; body: string; severity: SeverityLevel }>,
   ): Promise<void> {
-    if (comments.length === 0) return;
+    const formattedComments = comments?.map((c) => ({
+      path: c.path,
+      line: c.line,
+      body: this.formatInlineComment(c.body, c.severity),
+    }));
 
     await this.octokit.rest.pulls.createReview({
       ...this.repo,
       pull_number: prNumber,
+      commit_id: commitId,
+      body: summary,
       event: "COMMENT",
-      comments: comments.map((c) => ({
-        path: c.path,
-        line: c.line,
-        body: c.body,
-      })),
+      comments: formattedComments && formattedComments.length > 0 ? formattedComments : undefined,
     });
+
+    core.info(
+      `Review posted with summary and ${formattedComments?.length || 0} inline comments`
+    );
   }
 
   async getChangedFiles(prNumber: number): Promise<string[]> {
@@ -86,10 +130,15 @@ export class GitHubService {
   }
 
   async deleteComment(commentId: number) {
-    await this.octokit.rest.issues.deleteComment({
-      ...this.repo,
-      comment_id: commentId,
-    });
+    try {
+      await this.octokit.rest.issues.deleteComment({
+        ...this.repo,
+        comment_id: commentId,
+      });
+      core.info(`Deleted issue comment ${commentId}`);
+    } catch (error) {
+      core.warning(`Failed to delete issue comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   async listReviewComments(prNumber: number) {
@@ -101,7 +150,14 @@ export class GitHubService {
   }
 
   async listBotComments(prNumber: number): Promise<
-    Array<{ id: number; body: string; path?: string; line?: number; type: "issue" | "review" }>
+    Array<{
+      id: number;
+      body: string;
+      path?: string;
+      line?: number;
+      type: "issue" | "review";
+      isOutdated: boolean;
+    }>
   > {
     const botUser = await this.getAuthenticatedUser();
     const result: Array<{
@@ -110,9 +166,11 @@ export class GitHubService {
       path?: string;
       line?: number;
       type: "issue" | "review";
+      isOutdated: boolean;
     }> = [];
 
     // 1. Issue Comments (General)
+    // Issue comments are generally "active" unless manually minimized, but we treat them as active here.
     const issueComments = await this.listComments(prNumber);
     for (const comment of issueComments) {
       if (comment.user?.login === botUser.login) {
@@ -120,6 +178,7 @@ export class GitHubService {
           id: comment.id,
           body: comment.body || "",
           type: "issue",
+          isOutdated: false,
         });
       }
     }
@@ -128,24 +187,61 @@ export class GitHubService {
     const reviewComments = await this.listReviewComments(prNumber);
     for (const comment of reviewComments) {
       if (comment.user?.login === botUser.login) {
+        // A review comment is outdated if it has no position in the current diff
+        const isOutdated = comment.position === null;
         result.push({
           id: comment.id,
           body: comment.body,
           path: comment.path,
           line: comment.line || comment.original_line || undefined,
           type: "review",
+          isOutdated,
         });
       }
     }
+
+    core.info(`Found ${result.length} bot comments (${result.filter(c => !c.isOutdated).length} active, ${result.filter(c => c.isOutdated).length} outdated)`);
 
     return result;
   }
 
   async deleteReviewComment(commentId: number) {
-    await this.octokit.rest.pulls.deleteReviewComment({
-      ...this.repo,
-      comment_id: commentId,
-    });
+    try {
+      await this.octokit.rest.pulls.deleteReviewComment({
+        ...this.repo,
+        comment_id: commentId,
+      });
+      core.info(`Deleted review comment ${commentId}`);
+    } catch (error) {
+      core.warning(`Failed to delete review comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Delete multiple comments (both issue and review comments)
+   */
+  async deleteComments(commentIds: number[], prNumber: number): Promise<void> {
+    if (commentIds.length === 0) {
+      return;
+    }
+
+    core.info(`Deleting ${commentIds.length} comments...`);
+
+    const allComments = await this.listBotComments(prNumber);
+
+    for (const commentId of commentIds) {
+      const comment = allComments.find(c => c.id === commentId);
+      if (!comment) {
+        core.warning(`Comment ${commentId} not found, skipping deletion`);
+        continue;
+      }
+
+      if (comment.type === "issue") {
+        await this.deleteComment(commentId);
+      } else {
+        await this.deleteReviewComment(commentId);
+      }
+    }
   }
 
   async createReply(prNumber: number, commentId: number, body: string) {
@@ -157,7 +253,7 @@ export class GitHubService {
     });
   }
 
-  async getCommentThread(prNumber: number, commentId: number): Promise<Array<{author: string; body: string; isBot: boolean}>> {
+  async getCommentThread(prNumber: number, commentId: number): Promise<Array<{ author: string; body: string; isBot: boolean }>> {
     try {
       // Fetch the specific comment to get its position in the thread
       const { data: comment } = await this.octokit.rest.pulls.getReviewComment({
@@ -172,12 +268,26 @@ export class GitHubService {
         pull_number: prNumber,
       });
 
-      // Find comments in the same thread (same file, same position, same commit)
-      const threadComments = allComments.filter(c =>
-        c.path === comment.path &&
-        c.position === comment.position &&
-        c.commit_id === comment.commit_id
+      // Find comments in the same thread
+      // GitHub uses in_reply_to_id to link replies
+      const threadComments: typeof allComments = [];
+
+      // Find the root comment (the one without in_reply_to_id or the original comment)
+      let rootComment = comment;
+      if (comment.in_reply_to_id) {
+        const root = allComments.find(c => c.id === comment.in_reply_to_id);
+        if (root) rootComment = root;
+      }
+
+      // Add root comment
+      threadComments.push(rootComment);
+
+      // Find all replies to this root comment
+      const replies = allComments.filter(c =>
+        c.in_reply_to_id === rootComment.id
       );
+
+      threadComments.push(...replies);
 
       // Sort by created_at to get chronological order
       threadComments.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
@@ -196,5 +306,13 @@ export class GitHubService {
       // Return empty array on failure, caller can handle gracefully
       return [];
     }
+  }
+
+  /**
+   * Get commit SHA for the PR head
+   */
+  async getPRHeadSHA(prNumber: number): Promise<string> {
+    const pr = await this.getPRDetails(prNumber);
+    return pr.head.sha;
   }
 }
