@@ -162,7 +162,7 @@ async function run(): Promise<void> {
 
     // 5. Get AI Review (with previous summaries for context)
     core.info("🤖 Requesting review from AI...");
-    const review = await aiService.getReview(diff, existingComments, previousSummaries, customInstructions);
+    const review = await aiService.getReview(diff, existingComments, [], customInstructions);
 
     // 6. Minimize Outdated Comments (as requested by AI)
     if (review.minimizeCommentIds && review.minimizeCommentIds.length > 0) {
