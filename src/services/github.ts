@@ -99,17 +99,20 @@ export class GitHubService {
       body: this.formatInlineComment(c.body, c.severity),
     }));
 
-    // Format summary as NOTE alert
+    // Post summary as a separate issue comment (so it can be deleted easily)
     const formattedSummary = this.formatSummary(summary);
+    await this.postComment(prNumber, formattedSummary);
 
-    await this.octokit.rest.pulls.createReview({
-      ...this.repo,
-      pull_number: prNumber,
-      commit_id: commitId,
-      body: formattedSummary,
-      event: "COMMENT",
-      comments: formattedComments && formattedComments.length > 0 ? formattedComments : undefined,
-    });
+    // Post inline comments as a review (without body)
+    if (formattedComments && formattedComments.length > 0) {
+      await this.octokit.rest.pulls.createReview({
+        ...this.repo,
+        pull_number: prNumber,
+        commit_id: commitId,
+        event: "COMMENT",
+        comments: formattedComments,
+      });
+    }
 
     core.info(
       `Review posted with summary and ${formattedComments?.length || 0} inline comments`
@@ -176,6 +179,7 @@ export class GitHubService {
       line?: number;
       type: "issue" | "review";
       isOutdated: boolean;
+      isSummary?: boolean;
     }>
   > {
     const botUser = await this.getAuthenticatedUser();
@@ -186,6 +190,7 @@ export class GitHubService {
       line?: number;
       type: "issue" | "review";
       isOutdated: boolean;
+      isSummary?: boolean;
     }> = [];
 
     // 1. Issue Comments (General)
@@ -193,11 +198,15 @@ export class GitHubService {
     const issueComments = await this.listComments(prNumber);
     for (const comment of issueComments) {
       if (comment.user?.login === botUser.login) {
+        // Check if this is a summary comment (starts with NOTE alert and has "AI Review Summary")
+        const isSummary = comment.body?.includes("> [!NOTE]") && comment.body?.includes("**AI Review Summary**");
+
         result.push({
           id: comment.id,
           body: comment.body || "",
           type: "issue",
           isOutdated: false,
+          isSummary,
         });
       }
     }
@@ -215,11 +224,12 @@ export class GitHubService {
           line: comment.line || comment.original_line || undefined,
           type: "review",
           isOutdated,
+          isSummary: false,
         });
       }
     }
 
-    core.info(`Found ${result.length} bot comments (${result.filter(c => !c.isOutdated).length} active, ${result.filter(c => c.isOutdated).length} outdated)`);
+    core.info(`Found ${result.length} bot comments (${result.filter(c => !c.isOutdated).length} active, ${result.filter(c => c.isOutdated).length} outdated, ${result.filter(c => c.isSummary).length} summaries)`);
 
     return result;
   }
@@ -261,6 +271,26 @@ export class GitHubService {
         await this.deleteReviewComment(commentId);
       }
     }
+  }
+
+  /**
+   * Delete all previous summary comments
+   */
+  async deletePreviousSummaries(prNumber: number): Promise<number> {
+    const allComments = await this.listBotComments(prNumber);
+    const summaries = allComments.filter(c => c.isSummary);
+
+    if (summaries.length === 0) {
+      return 0;
+    }
+
+    core.info(`🗑️  Deleting ${summaries.length} previous summary comment(s)...`);
+
+    for (const summary of summaries) {
+      await this.deleteComment(summary.id);
+    }
+
+    return summaries.length;
   }
 
   async createReply(prNumber: number, commentId: number, body: string) {

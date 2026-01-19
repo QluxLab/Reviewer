@@ -36155,13 +36155,22 @@ async function run() {
         // 4. Fetch Existing Comments for Context
         core.info("💬 Fetching existing bot comments...");
         const existingComments = await githubService.listBotComments(prNumber);
+        // Extract previous summaries for AI context
+        const previousSummaries = existingComments
+            .filter(c => c.isSummary)
+            .map(c => c.body);
+        // Delete all previous summaries before creating new one
+        const deletedSummariesCount = await githubService.deletePreviousSummaries(prNumber);
+        if (deletedSummariesCount > 0) {
+            core.info(`🧹 Cleaned up ${deletedSummariesCount} previous summary comment(s)`);
+        }
         // If it's a synchronize event (new commit), we keep existing comments for context
         if (eventName === "pull_request" && payload.action === "synchronize") {
             core.info("🔄 Synchronize event: Using existing comments for consistency and deduplication");
         }
-        // 5. Get AI Review
+        // 5. Get AI Review (with previous summaries for context)
         core.info("🤖 Requesting review from AI...");
-        const review = await aiService.getReview(diff, existingComments, customInstructions);
+        const review = await aiService.getReview(diff, existingComments, previousSummaries, customInstructions);
         // 6. Delete Outdated Comments (as requested by AI)
         if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
             core.info(`🗑️  Deleting ${review.deleteCommentIds.length} outdated comments...`);
@@ -36223,7 +36232,7 @@ async function run() {
         // Convert comments from AIReviewResponse format to GitHubService format
         // AIReviewResponse uses 'file', but createReview expects 'path'
         const formattedComments = filteredComments.map(c => ({
-            path: c.file, // Изменение: file -> path
+            path: c.file,
             line: c.line,
             body: c.body,
             severity: c.severity
@@ -36358,7 +36367,7 @@ Keep your response concise and professional.
             throw error;
         }
     }
-    async getReview(diff, existingComments, customInstructions) {
+    async getReview(diff, existingComments, previousSummaries, customInstructions) {
         const processedDiff = (0, utils_1.processDiff)(diff);
         // Separate active review comments (bot's previous reviews) from other comments
         const previousReviews = existingComments.filter((c) => c.type === "review" && !c.isOutdated);
@@ -36469,6 +36478,11 @@ CONSISTENCY WITH PREVIOUS REVIEWS:
 - If you previously recommended a pattern/approach, don't suggest the opposite now unless the context has significantly changed.
 - If the developer addressed your previous comment, acknowledge it and don't repeat the same issue.
 - Build upon your previous reviews - if you see the same pattern elsewhere, reference your earlier feedback.
+${previousSummaries.length > 0 ? `
+- You also have access to your previous summary comments to maintain context across reviews.
+- Consider what was mentioned in previous summaries when writing the new one.
+- If issues from previous summaries are now resolved, acknowledge that progress.
+` : ''}
 `;
         const userPrompt = `
 ${customInstructions ? `Additional Instructions: ${customInstructions}\n` : ""}
@@ -36484,6 +36498,14 @@ YOUR PREVIOUS REVIEW COMMENTS (for context and consistency):
 ${previousReviews.map((c) => `[${c.path}:${c.line}] ${c.body}`).join("\n\n")}
 
 Remember to stay consistent with your previous feedback.
+` : ""}
+
+${previousSummaries.length > 0 ? `
+YOUR PREVIOUS REVIEW SUMMARIES (for context):
+${previousSummaries.map((summary, i) => `--- Review #${i + 1} ---\n${summary}`).join("\n\n")}
+
+Use this context to write a comprehensive summary that builds upon previous reviews.
+If issues mentioned in previous summaries are now resolved, acknowledge that progress.
 ` : ""}
 
 Use the available tools to submit your review and manage comments.
@@ -36737,16 +36759,19 @@ class GitHubService {
             line: c.line,
             body: this.formatInlineComment(c.body, c.severity),
         }));
-        // Format summary as NOTE alert
+        // Post summary as a separate issue comment (so it can be deleted easily)
         const formattedSummary = this.formatSummary(summary);
-        await this.octokit.rest.pulls.createReview({
-            ...this.repo,
-            pull_number: prNumber,
-            commit_id: commitId,
-            body: formattedSummary,
-            event: "COMMENT",
-            comments: formattedComments && formattedComments.length > 0 ? formattedComments : undefined,
-        });
+        await this.postComment(prNumber, formattedSummary);
+        // Post inline comments as a review (without body)
+        if (formattedComments && formattedComments.length > 0) {
+            await this.octokit.rest.pulls.createReview({
+                ...this.repo,
+                pull_number: prNumber,
+                commit_id: commitId,
+                event: "COMMENT",
+                comments: formattedComments,
+            });
+        }
         core.info(`Review posted with summary and ${formattedComments?.length || 0} inline comments`);
     }
     async getChangedFiles(prNumber) {
@@ -36804,11 +36829,14 @@ class GitHubService {
         const issueComments = await this.listComments(prNumber);
         for (const comment of issueComments) {
             if (comment.user?.login === botUser.login) {
+                // Check if this is a summary comment (starts with NOTE alert and has "AI Review Summary")
+                const isSummary = comment.body?.includes("> [!NOTE]") && comment.body?.includes("**AI Review Summary**");
                 result.push({
                     id: comment.id,
                     body: comment.body || "",
                     type: "issue",
                     isOutdated: false,
+                    isSummary,
                 });
             }
         }
@@ -36825,10 +36853,11 @@ class GitHubService {
                     line: comment.line || comment.original_line || undefined,
                     type: "review",
                     isOutdated,
+                    isSummary: false,
                 });
             }
         }
-        core.info(`Found ${result.length} bot comments (${result.filter(c => !c.isOutdated).length} active, ${result.filter(c => c.isOutdated).length} outdated)`);
+        core.info(`Found ${result.length} bot comments (${result.filter(c => !c.isOutdated).length} active, ${result.filter(c => c.isOutdated).length} outdated, ${result.filter(c => c.isSummary).length} summaries)`);
         return result;
     }
     async deleteReviewComment(commentId) {
@@ -36865,6 +36894,21 @@ class GitHubService {
                 await this.deleteReviewComment(commentId);
             }
         }
+    }
+    /**
+     * Delete all previous summary comments
+     */
+    async deletePreviousSummaries(prNumber) {
+        const allComments = await this.listBotComments(prNumber);
+        const summaries = allComments.filter(c => c.isSummary);
+        if (summaries.length === 0) {
+            return 0;
+        }
+        core.info(`🗑️  Deleting ${summaries.length} previous summary comment(s)...`);
+        for (const summary of summaries) {
+            await this.deleteComment(summary.id);
+        }
+        return summaries.length;
     }
     async createReply(prNumber, commentId, body) {
         await this.octokit.rest.pulls.createReplyForReviewComment({

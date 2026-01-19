@@ -94,7 +94,9 @@ Keep your response concise and professional.
       line?: number;
       type: "issue" | "review";
       isOutdated: boolean;
+      isSummary?: boolean;
     }>,
+    previousSummaries: Array<string>,
     customInstructions?: string,
   ): Promise<AIReviewResponse> {
     const processedDiff = processDiff(diff);
@@ -211,6 +213,11 @@ CONSISTENCY WITH PREVIOUS REVIEWS:
 - If you previously recommended a pattern/approach, don't suggest the opposite now unless the context has significantly changed.
 - If the developer addressed your previous comment, acknowledge it and don't repeat the same issue.
 - Build upon your previous reviews - if you see the same pattern elsewhere, reference your earlier feedback.
+${previousSummaries.length > 0 ? `
+- You also have access to your previous summary comments to maintain context across reviews.
+- Consider what was mentioned in previous summaries when writing the new one.
+- If issues from previous summaries are now resolved, acknowledge that progress.
+` : ''}
 `;
 
     const userPrompt = `
@@ -227,6 +234,14 @@ YOUR PREVIOUS REVIEW COMMENTS (for context and consistency):
 ${previousReviews.map((c) => `[${c.path}:${c.line}] ${c.body}`).join("\n\n")}
 
 Remember to stay consistent with your previous feedback.
+` : ""}
+
+${previousSummaries.length > 0 ? `
+YOUR PREVIOUS REVIEW SUMMARIES (for context):
+${previousSummaries.map((summary, i) => `--- Review #${i + 1} ---\n${summary}`).join("\n\n")}
+
+Use this context to write a comprehensive summary that builds upon previous reviews.
+If issues mentioned in previous summaries are now resolved, acknowledge that progress.
 ` : ""}
 
 Use the available tools to submit your review and manage comments.

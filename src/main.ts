@@ -144,14 +144,25 @@ async function run(): Promise<void> {
     core.info("💬 Fetching existing bot comments...");
     const existingComments = await githubService.listBotComments(prNumber);
 
+    // Extract previous summaries for AI context
+    const previousSummaries = existingComments
+      .filter(c => c.isSummary)
+      .map(c => c.body);
+
+    // Delete all previous summaries before creating new one
+    const deletedSummariesCount = await githubService.deletePreviousSummaries(prNumber);
+    if (deletedSummariesCount > 0) {
+      core.info(`🧹 Cleaned up ${deletedSummariesCount} previous summary comment(s)`);
+    }
+
     // If it's a synchronize event (new commit), we keep existing comments for context
     if (eventName === "pull_request" && payload.action === "synchronize") {
       core.info("🔄 Synchronize event: Using existing comments for consistency and deduplication");
     }
 
-    // 5. Get AI Review
+    // 5. Get AI Review (with previous summaries for context)
     core.info("🤖 Requesting review from AI...");
-    const review = await aiService.getReview(diff, existingComments, customInstructions);
+    const review = await aiService.getReview(diff, existingComments, previousSummaries, customInstructions);
 
     // 6. Delete Outdated Comments (as requested by AI)
     if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
@@ -222,7 +233,7 @@ async function run(): Promise<void> {
     // Convert comments from AIReviewResponse format to GitHubService format
     // AIReviewResponse uses 'file', but createReview expects 'path'
     const formattedComments = filteredComments.map(c => ({
-      path: c.file, // Изменение: file -> path
+      path: c.file,
       line: c.line,
       body: c.body,
       severity: c.severity
