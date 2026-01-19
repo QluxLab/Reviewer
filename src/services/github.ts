@@ -61,7 +61,7 @@ export class GitHubService {
     const lines = summary.split("\n");
     const formattedLines = lines.map(line => `> ${line}`);
     core.info(summary);
-    return `# 📋 PR Summary\n\n> [!NOTE]\n${formattedLines.join("\n")}`;
+    return summary// `# 📋 PR Summary\n\n> [!NOTE]\n${formattedLines.join("\n")}`;
   }
 
   async getPullRequestDiff(prNumber: number): Promise<string> {
