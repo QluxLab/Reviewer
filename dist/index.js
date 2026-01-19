@@ -36771,10 +36771,10 @@ class GitHubService {
         if (summary.trim().startsWith("> [!")) {
             return summary;
         }
-        // Wrap summary in NOTE alert
+        // Clean format with markdown header and NOTE alert
         const lines = summary.split("\n");
         const formattedLines = lines.map(line => `> ${line}`);
-        return `> [!NOTE]\n> **AI Review Summary**\n>\n${formattedLines.join("\n")}`;
+        return `# 📋 PR Summary\n\n> [!NOTE]\n${formattedLines.join("\n")}`;
     }
     async getPullRequestDiff(prNumber) {
         const { data: diff } = await this.octokit.rest.pulls.get({
@@ -36873,8 +36873,9 @@ class GitHubService {
         const issueComments = await this.listComments(prNumber);
         for (const comment of issueComments) {
             if (comment.user?.login === botUser.login) {
-                // Check if this is a summary comment (starts with NOTE alert and has "AI Review Summary")
-                const isSummary = comment.body?.includes("> [!NOTE]") && comment.body?.includes("**AI Review Summary**");
+                // Check if this is a summary comment (contains "# 📋 PR Summary" or old format)
+                const isSummary = comment.body?.includes("# 📋 PR Summary") ||
+                    (comment.body?.includes("> [!NOTE]") && comment.body?.includes("**AI Review Summary**"));
                 result.push({
                     id: comment.id,
                     body: comment.body || "",
