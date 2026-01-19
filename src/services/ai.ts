@@ -14,6 +14,7 @@ export interface AIReviewResponse {
     severity: SeverityLevel;
   }>;
   deleteCommentIds?: number[];
+  minimizeCommentIds?: number[];
 }
 
 export class AIService {
@@ -95,6 +96,7 @@ Keep your response concise and professional.
       type: "issue" | "review";
       isOutdated: boolean;
       isSummary?: boolean;
+      isMinimized?: boolean;
     }>,
     previousSummaries: Array<string>,
     customInstructions?: string,
@@ -103,7 +105,12 @@ Keep your response concise and professional.
 
     // Separate active review comments (bot's previous reviews) from other comments
     const previousReviews = existingComments.filter(
-      (c) => c.type === "review" && !c.isOutdated
+      (c) => c.type === "review" && !c.isOutdated && !c.isMinimized
+    );
+
+    // Get outdated but not minimized comments
+    const outdatedComments = existingComments.filter(
+      (c) => c.type === "review" && c.isOutdated && !c.isMinimized
     );
 
     const systemPrompt = `
@@ -196,16 +203,22 @@ IMPORTANT IMPLEMENTATION DETAILS:
 - Always start inline comment body with the appropriate alert syntax (e.g., "> [!CAUTION]")
 - Be precise and confident in your feedback. Avoid vague language.
 - Directly state the issue and the solution.
-- You can delete your old comments if they are no longer relevant (e.g., the issue was fixed).
 
 IMPORTANT - COMMENT MANAGEMENT:
 - You are provided with a list of "existing comments" on the PR.
 - Some comments are marked as 'isOutdated: true'. This means they were made on a previous commit and the code line has since changed.
-- GitHub automatically collapses these outdated comments.
+- GitHub automatically collapses these outdated comments, but you can also MINIMIZE them to hide them completely.
 - DO NOT report the same issue again if it was already reported in an outdated comment, UNLESS the issue persists in the new code.
 - If an issue persists, you SHOULD report it again on the new line.
-- Do NOT delete outdated comments using 'delete_comment' unless you made a mistake and the comment was never valid. Let GitHub handle the history.
-- EXISTING ACTIVE COMMENTS (isOutdated: false): Do NOT report these again. We want to avoid duplicate comments on the same line.
+- EXISTING ACTIVE COMMENTS (isOutdated: false, isMinimized: false): Do NOT report these again. We want to avoid duplicate comments on the same line.
+
+COMMENT ACTIONS AVAILABLE:
+1. **delete_comment** - Permanently delete a comment (use sparingly, only for mistakes)
+2. **minimize_comment** - Hide/collapse a comment as OUTDATED (preferred for old comments that are no longer relevant)
+
+When to use minimize vs delete:
+- MINIMIZE: When an old comment is no longer relevant due to code changes (preferred approach)
+- DELETE: Only when a comment was posted by mistake or is completely invalid
 
 CONSISTENCY WITH PREVIOUS REVIEWS:
 - You have access to your previous review comments below.
@@ -236,6 +249,13 @@ ${previousReviews.map((c) => `[${c.path}:${c.line}] ${c.body}`).join("\n\n")}
 Remember to stay consistent with your previous feedback.
 ` : ""}
 
+${outdatedComments.length > 0 ? `
+OUTDATED COMMENTS (consider minimizing these):
+${outdatedComments.map((c) => `ID: ${c.id} - [${c.path}:${c.line || 'unknown'}] ${c.body.substring(0, 100)}...`).join("\n")}
+
+These comments are outdated because the code has changed. Consider using minimize_comment tool to hide them.
+` : ""}
+
 ${previousSummaries.length > 0 ? `
 YOUR PREVIOUS REVIEW SUMMARIES (for context):
 ${previousSummaries.map((summary, i) => `--- Review #${i + 1} ---\n${summary}`).join("\n\n")}
@@ -253,13 +273,31 @@ Use the available tools to submit your review and manage comments.
         type: "function",
         function: {
           name: "delete_comment",
-          description: "Delete an existing comment that is no longer valid or relevant.",
+          description: "Permanently delete an existing comment. Use ONLY when a comment was posted by mistake or is completely invalid. For outdated comments, prefer minimize_comment instead.",
           parameters: {
             type: "object",
             properties: {
               comment_id: {
                 type: "integer",
                 description: "The ID of the comment to delete",
+              },
+            },
+            required: ["comment_id"],
+            additionalProperties: false,
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "minimize_comment",
+          description: "Hide/collapse a comment by marking it as OUTDATED. This is the preferred way to handle comments that are no longer relevant due to code changes. The comment will still be visible in the 'Show resolved' view.",
+          parameters: {
+            type: "object",
+            properties: {
+              comment_id: {
+                type: "integer",
+                description: "The ID of the comment to minimize",
               },
             },
             required: ["comment_id"],
@@ -337,6 +375,7 @@ Use the available tools to submit your review and manage comments.
         summary: "",
         comments: [],
         deleteCommentIds: [],
+        minimizeCommentIds: [],
       };
 
       const toolCalls = completion.choices[0].message.tool_calls;
@@ -347,6 +386,8 @@ Use the available tools to submit your review and manage comments.
 
           if (toolCall.function.name === "delete_comment") {
             response.deleteCommentIds!.push(args.comment_id);
+          } else if (toolCall.function.name === "minimize_comment") {
+            response.minimizeCommentIds!.push(args.comment_id);
           } else if (toolCall.function.name === "submit_review") {
             response.summary = args.summary;
             if (args.comments) {
@@ -360,7 +401,7 @@ Use the available tools to submit your review and manage comments.
       }
 
       // If submit_review wasn't called (unlikely with tool_choice: required, but possible if model loops on deletes), handle gracefully
-      if (!response.summary && !response.deleteCommentIds?.length) {
+      if (!response.summary && !response.deleteCommentIds?.length && !response.minimizeCommentIds?.length) {
         // Fallback or warning could go here, but for now we trust the model to behave
         core.warning("AI did not submit a review summary.");
       }

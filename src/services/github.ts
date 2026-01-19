@@ -180,6 +180,7 @@ export class GitHubService {
       type: "issue" | "review";
       isOutdated: boolean;
       isSummary?: boolean;
+      isMinimized?: boolean;
     }>
   > {
     const botUser = await this.getAuthenticatedUser();
@@ -191,6 +192,7 @@ export class GitHubService {
       type: "issue" | "review";
       isOutdated: boolean;
       isSummary?: boolean;
+      isMinimized?: boolean;
     }> = [];
 
     // 1. Issue Comments (General)
@@ -207,6 +209,7 @@ export class GitHubService {
           type: "issue",
           isOutdated: false,
           isSummary,
+          isMinimized: false, // Issue comments don't get minimized via API
         });
       }
     }
@@ -225,6 +228,8 @@ export class GitHubService {
           type: "review",
           isOutdated,
           isSummary: false,
+          // @ts-ignore - GitHub API may include this field
+          isMinimized: comment.isMinimized || false,
         });
       }
     }
@@ -243,6 +248,61 @@ export class GitHubService {
       core.info(`Deleted review comment ${commentId}`);
     } catch (error) {
       core.warning(`Failed to delete review comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Minimize (hide) a comment instead of deleting it
+   */
+  async minimizeComment(commentId: number, nodeId?: string, classifier: string = "OUTDATED"): Promise<boolean> {
+    try {
+      // If nodeId is not provided, we need to fetch it
+      if (!nodeId) {
+        // Try to get it from review comment first
+        try {
+          const { data: comment } = await this.octokit.rest.pulls.getReviewComment({
+            ...this.repo,
+            comment_id: commentId,
+          });
+          // @ts-ignore - node_id exists but not in types
+          nodeId = comment.node_id;
+        } catch {
+          // If not a review comment, try issue comment
+          const { data: comment } = await this.octokit.rest.issues.getComment({
+            ...this.repo,
+            comment_id: commentId,
+          });
+          nodeId = comment.node_id;
+        }
+      }
+
+      if (!nodeId) {
+        core.warning(`Could not find node_id for comment ${commentId}`);
+        return false;
+      }
+
+      // Use GraphQL to minimize the comment
+      const mutation = `
+        mutation MinimizeComment($subjectId: ID!, $classifier: ReportedContentClassifiers!) {
+          minimizeComment(input: { subjectId: $subjectId, classifier: $classifier }) {
+            minimizedComment {
+              isMinimized
+              minimizedReason
+            }
+          }
+        }
+      `;
+
+      await this.octokit.graphql(mutation, {
+        subjectId: nodeId,
+        classifier: classifier,
+      });
+
+      core.info(`✓ Minimized comment ${commentId} (reason: ${classifier})`);
+      return true;
+    } catch (error) {
+      core.warning(`Failed to minimize comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      return false;
     }
   }
 
@@ -271,6 +331,44 @@ export class GitHubService {
         await this.deleteReviewComment(commentId);
       }
     }
+  }
+
+  /**
+   * Minimize (hide) multiple comments
+   */
+  async minimizeComments(
+    commentIds: number[],
+    prNumber: number,
+    classifier: "OUTDATED" | "RESOLVED" | "DUPLICATE" | "SPAM" | "ABUSE" | "OFF_TOPIC" = "OUTDATED"
+  ): Promise<number> {
+    if (commentIds.length === 0) {
+      return 0;
+    }
+
+    core.info(`🔽 Minimizing ${commentIds.length} comment(s) as ${classifier}...`);
+
+    const allComments = await this.listBotComments(prNumber);
+    let successCount = 0;
+
+    for (const commentId of commentIds) {
+      const comment = allComments.find(c => c.id === commentId);
+      if (!comment) {
+        core.warning(`Comment ${commentId} not found, skipping`);
+        continue;
+      }
+
+      // Only minimize review comments (inline comments)
+      // Issue comments cannot be minimized via API in the same way
+      if (comment.type === "review") {
+        const success = await this.minimizeComment(commentId, undefined, classifier);
+        if (success) successCount++;
+      } else {
+        core.info(`Skipping issue comment ${commentId} (cannot minimize issue comments)`);
+      }
+    }
+
+    core.info(`✓ Successfully minimized ${successCount}/${commentIds.length} comments`);
+    return successCount;
   }
 
   /**

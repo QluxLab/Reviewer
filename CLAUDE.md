@@ -35,7 +35,7 @@ npm run format
 
 ### Core Architecture Pattern
 - **Service-Oriented Architecture**: Clear separation of concerns with dedicated services
-- **Event-Driven Workflow**: Responds to GitHub events (`pull_request`, `issue_comment`)
+- **Event-Driven Workflow**: Responds to GitHub events (`pull_request`, `issue_comment`, `pull_request_review_comment`)
 - **TypeScript-First**: Full type safety with strict configuration
 
 ### Main Components
@@ -53,6 +53,14 @@ npm run format
 
 #### Utilities
 - **`src/utils.ts`**: Helper functions for file filtering, comment parsing, and severity handling
+
+### Event Handling Flow
+1. **Event Detection**: Listens for `pull_request` (opened/synchronize), `issue_comment` (created), and `pull_request_review_comment` (created) events
+2. **Validation**: Checks event types and comment parsing (`/review` commands)
+3. **File Processing**: Fetches changed files, applies ignore patterns
+4. **AI Integration**: Sends diffs to OpenAI API, processes structured responses
+5. **Result Posting**: Posts summary comments and creates inline review comments
+6. **Comment Management**: Deletes outdated comments and handles user replies
 
 ## File Structure and Organization
 
@@ -78,6 +86,7 @@ interface Config {
   systemMessage: string;
   ignorePatterns: string[];
   minSeverity: SeverityLevel;
+  disableInline: boolean;
 }
 ```
 
@@ -91,31 +100,40 @@ interface AIReviewResponse {
     body: string;
     severity: SeverityLevel;
   }>;
+  deleteCommentIds?: number[];
 }
 ```
 
 ### Severity Levels
 - `low`, `medium`, `high`, `critical` - Used for comment filtering and prioritization
+- Mapped to GitHub Alert syntax:
+  - `critical` → `> [!CAUTION]`
+  - `high` → `> [!WARNING]`
+  - `medium` → `> [!IMPORTANT]`
+  - `low` → `> [!TIP]` or `> [!NOTE]`
 
-## Development Guidelines
+## AI Integration Features
 
-### Event Handling Flow
-1. **Event Detection**: Listens for `pull_request` and `issue_comment` events
-2. **Validation**: Checks event types and comment parsing (`/review` commands)
-3. **File Processing**: Fetches changed files, applies ignore patterns
-4. **AI Integration**: Sends diffs to OpenAI API, processes structured responses
-5. **Result Posting**: Posts summary comments and creates inline review comments
-
-### AI Integration Features
-- **Multi-provider Support**: OpenAI, Azure, vLLM, Ollama, etc.
+- **Multi-provider Support**: OpenAI, Azure, vLLM, Ollama, and other OpenAI-compatible APIs
 - **JSON Response Format**: Structured AI output for consistent processing
 - **Line Number Accuracy**: Uses diff parsing for precise comment placement
 - **Severity Filtering**: Configurable minimum severity levels for comments
+- **Interactive Mode**: Handles user replies to AI comments with context-aware responses
+- **Comment Management**: AI can delete its own outdated comments via function calling
 
-### File Processing Pipeline
-- **Glob Pattern Matching**: Configurable file ignore patterns
+### AI Prompt Structure
+The AI service uses a comprehensive system prompt that guides the model to:
+1. Analyze code for security, performance, code quality, architecture, and testing issues
+2. Provide structured output with summary and inline comments
+3. Use GitHub Alert syntax for severity levels
+4. Maintain consistency with previous reviews
+5. Manage comment lifecycle (delete outdated comments)
+
+## File Processing Pipeline
+
+- **Glob Pattern Matching**: Configurable file ignore patterns via `minimatch`
 - **Diff Parsing**: Uses `parse-diff` library for accurate line numbers
-- **Performance Considerations**: TODO item exists for large PR handling
+- **Performance Considerations**: Handles large PRs by processing all files at once
 
 ## Key Development Considerations
 
@@ -123,26 +141,19 @@ interface AIReviewResponse {
 - API keys handled through environment variables
 - Input validation for all GitHub Action inputs
 - File pattern filtering prevents processing sensitive files
+- Bot detection to avoid infinite loops in comment replies
 
 ### Error Handling
 - Comprehensive try-catch blocks throughout the workflow
 - GitHub Actions core utilities for logging and error reporting
 - Graceful degradation when AI service is unavailable
+- Fallback mechanisms for comment thread fetching
 
 ### Extensibility Points
 - **AI Provider**: Easy to add new OpenAI-compatible providers
 - **File Processing**: Additional filtering and transformation logic
 - **Comment Formatting**: Custom comment templates and styling
 - **Event Handling**: Support for additional GitHub events
-
-## Testing Strategy
-
-While no formal test suite exists, development should follow these testing practices:
-
-1. **Manual Integration Testing**: Test via actual GitHub Actions workflows
-2. **Input Validation**: Verify all configuration inputs are properly validated
-3. **Error Scenarios**: Test various failure modes (API errors, invalid inputs, etc.)
-4. **AI Response Handling**: Test different AI output formats and edge cases
 
 ## Configuration Management
 
@@ -152,10 +163,11 @@ While no formal test suite exists, development should follow these testing pract
 
 ### Optional Inputs
 - `model`: AI model selection (default: 'gpt-4o')
-- `openai_base_url`: Custom API endpoint
+- `openai_base_url`: Custom API endpoint (default: 'https://api.openai.com/v1')
 - `system_message`: Custom AI instructions
-- `ignore_patterns`: File filtering patterns
-- `min_severity`: Minimum comment severity level
+- `ignore_patterns`: File filtering patterns (default: 'package-lock.json,yarn.lock,dist/**,*.svg')
+- `min_severity`: Minimum comment severity level (default: 'low')
+- `disable_inline`: Disable inline comments generation (default: 'false')
 
 ## Build System
 
@@ -184,7 +196,7 @@ While no formal test suite exists, development should follow these testing pract
 4. Rebuild with `npm run build`
 
 ### Debugging
-- Use GitHub Actions core logging functions (`core.info`, `core.debug`)
+- Use GitHub Actions core logging functions (`core.info`, `core.debug`, `core.warning`)
 - Add console.log statements during development (removed in production)
 - Test with various PR scenarios and comment types
 
@@ -192,3 +204,60 @@ While no formal test suite exists, development should follow these testing pract
 - Consider diff chunking for large PRs (TODO in main.ts)
 - Optimize AI response parsing for better error handling
 - Implement caching for repeated operations where appropriate
+
+## Usage Patterns
+
+### Manual Trigger
+To trigger a review manually or with specific instructions, comment on the PR:
+
+**Standard Trigger**
+```text
+/review
+```
+
+**Custom Instructions**
+```text
+/review Focus on security vulnerabilities and performance optimizations.
+```
+
+### Interactive Reviews
+Users can reply to AI-generated comments. The system detects the reply, reads the conversation thread, and provides a contextual response.
+
+### Automatic Reviews
+The action automatically runs on:
+- New Pull Requests (`opened` event)
+- Updated Pull Requests (`synchronize` event)
+- Issue comments containing `/review` command
+
+## GitHub Action Workflow Example
+
+```yaml
+name: AI Review
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: AI Code Reviewer
+        uses: QluxLab/Reviewer@v1.0.0
+        with:
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Optional:
+          model: 'gpt-4o'
+          ignore_patterns: 'package-lock.json, *.svg'
+```

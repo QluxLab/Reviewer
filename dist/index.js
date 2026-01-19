@@ -36171,9 +36171,14 @@ async function run() {
         // 5. Get AI Review (with previous summaries for context)
         core.info("🤖 Requesting review from AI...");
         const review = await aiService.getReview(diff, existingComments, previousSummaries, customInstructions);
-        // 6. Delete Outdated Comments (as requested by AI)
+        // 6. Minimize Outdated Comments (as requested by AI)
+        if (review.minimizeCommentIds && review.minimizeCommentIds.length > 0) {
+            const minimizedCount = await githubService.minimizeComments(review.minimizeCommentIds, prNumber, "OUTDATED");
+            core.info(`✓ Minimized ${minimizedCount} outdated comment(s)`);
+        }
+        // 7. Delete Comments (as requested by AI - use sparingly)
         if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
-            core.info(`🗑️  Deleting ${review.deleteCommentIds.length} outdated comments...`);
+            core.info(`🗑️  Deleting ${review.deleteCommentIds.length} comment(s)...`);
             for (const commentId of review.deleteCommentIds) {
                 try {
                     const commentInfo = existingComments.find(c => c.id === commentId);
@@ -36203,7 +36208,7 @@ async function run() {
                 }
             }
         }
-        // 7. Post Review with Summary and Inline Comments
+        // 8. Post Review with Summary and Inline Comments
         const validComments = review.comments?.filter((c) => filesToReview.includes(c.file)) || [];
         // Filter comments based on severity
         const minSeverityLevel = (0, utils_1.getSeverityLevel)(config.minSeverity);
@@ -36243,10 +36248,12 @@ async function run() {
         core.info("✅ Review completed successfully!");
         core.info(`📋 Summary length: ${review.summary.length} characters`);
         core.info(`💬 Inline comments posted: ${filteredComments.length}`);
+        core.info(`🔽 Comments minimized: ${review.minimizeCommentIds?.length || 0}`);
         core.info(`🗑️  Comments deleted: ${review.deleteCommentIds?.length || 0}`);
         // Set outputs for workflow
         core.setOutput("summary", review.summary);
         core.setOutput("comments_count", filteredComments.length);
+        core.setOutput("minimized_comments_count", review.minimizeCommentIds?.length || 0);
         core.setOutput("deleted_comments_count", review.deleteCommentIds?.length || 0);
         core.setOutput("severity_distribution", JSON.stringify(severityCounts));
     }
@@ -36370,7 +36377,9 @@ Keep your response concise and professional.
     async getReview(diff, existingComments, previousSummaries, customInstructions) {
         const processedDiff = (0, utils_1.processDiff)(diff);
         // Separate active review comments (bot's previous reviews) from other comments
-        const previousReviews = existingComments.filter((c) => c.type === "review" && !c.isOutdated);
+        const previousReviews = existingComments.filter((c) => c.type === "review" && !c.isOutdated && !c.isMinimized);
+        // Get outdated but not minimized comments
+        const outdatedComments = existingComments.filter((c) => c.type === "review" && c.isOutdated && !c.isMinimized);
         const systemPrompt = `
 ## Role
 
@@ -36461,16 +36470,22 @@ IMPORTANT IMPLEMENTATION DETAILS:
 - Always start inline comment body with the appropriate alert syntax (e.g., "> [!CAUTION]")
 - Be precise and confident in your feedback. Avoid vague language.
 - Directly state the issue and the solution.
-- You can delete your old comments if they are no longer relevant (e.g., the issue was fixed).
 
 IMPORTANT - COMMENT MANAGEMENT:
 - You are provided with a list of "existing comments" on the PR.
 - Some comments are marked as 'isOutdated: true'. This means they were made on a previous commit and the code line has since changed.
-- GitHub automatically collapses these outdated comments.
+- GitHub automatically collapses these outdated comments, but you can also MINIMIZE them to hide them completely.
 - DO NOT report the same issue again if it was already reported in an outdated comment, UNLESS the issue persists in the new code.
 - If an issue persists, you SHOULD report it again on the new line.
-- Do NOT delete outdated comments using 'delete_comment' unless you made a mistake and the comment was never valid. Let GitHub handle the history.
-- EXISTING ACTIVE COMMENTS (isOutdated: false): Do NOT report these again. We want to avoid duplicate comments on the same line.
+- EXISTING ACTIVE COMMENTS (isOutdated: false, isMinimized: false): Do NOT report these again. We want to avoid duplicate comments on the same line.
+
+COMMENT ACTIONS AVAILABLE:
+1. **delete_comment** - Permanently delete a comment (use sparingly, only for mistakes)
+2. **minimize_comment** - Hide/collapse a comment as OUTDATED (preferred for old comments that are no longer relevant)
+
+When to use minimize vs delete:
+- MINIMIZE: When an old comment is no longer relevant due to code changes (preferred approach)
+- DELETE: Only when a comment was posted by mistake or is completely invalid
 
 CONSISTENCY WITH PREVIOUS REVIEWS:
 - You have access to your previous review comments below.
@@ -36500,6 +36515,13 @@ ${previousReviews.map((c) => `[${c.path}:${c.line}] ${c.body}`).join("\n\n")}
 Remember to stay consistent with your previous feedback.
 ` : ""}
 
+${outdatedComments.length > 0 ? `
+OUTDATED COMMENTS (consider minimizing these):
+${outdatedComments.map((c) => `ID: ${c.id} - [${c.path}:${c.line || 'unknown'}] ${c.body.substring(0, 100)}...`).join("\n")}
+
+These comments are outdated because the code has changed. Consider using minimize_comment tool to hide them.
+` : ""}
+
 ${previousSummaries.length > 0 ? `
 YOUR PREVIOUS REVIEW SUMMARIES (for context):
 ${previousSummaries.map((summary, i) => `--- Review #${i + 1} ---\n${summary}`).join("\n\n")}
@@ -36516,13 +36538,31 @@ Use the available tools to submit your review and manage comments.
                 type: "function",
                 function: {
                     name: "delete_comment",
-                    description: "Delete an existing comment that is no longer valid or relevant.",
+                    description: "Permanently delete an existing comment. Use ONLY when a comment was posted by mistake or is completely invalid. For outdated comments, prefer minimize_comment instead.",
                     parameters: {
                         type: "object",
                         properties: {
                             comment_id: {
                                 type: "integer",
                                 description: "The ID of the comment to delete",
+                            },
+                        },
+                        required: ["comment_id"],
+                        additionalProperties: false,
+                    },
+                },
+            },
+            {
+                type: "function",
+                function: {
+                    name: "minimize_comment",
+                    description: "Hide/collapse a comment by marking it as OUTDATED. This is the preferred way to handle comments that are no longer relevant due to code changes. The comment will still be visible in the 'Show resolved' view.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            comment_id: {
+                                type: "integer",
+                                description: "The ID of the comment to minimize",
                             },
                         },
                         required: ["comment_id"],
@@ -36597,6 +36637,7 @@ Use the available tools to submit your review and manage comments.
                 summary: "",
                 comments: [],
                 deleteCommentIds: [],
+                minimizeCommentIds: [],
             };
             const toolCalls = completion.choices[0].message.tool_calls;
             if (toolCalls) {
@@ -36604,6 +36645,9 @@ Use the available tools to submit your review and manage comments.
                     const args = JSON.parse(toolCall.function.arguments);
                     if (toolCall.function.name === "delete_comment") {
                         response.deleteCommentIds.push(args.comment_id);
+                    }
+                    else if (toolCall.function.name === "minimize_comment") {
+                        response.minimizeCommentIds.push(args.comment_id);
                     }
                     else if (toolCall.function.name === "submit_review") {
                         response.summary = args.summary;
@@ -36617,7 +36661,7 @@ Use the available tools to submit your review and manage comments.
                 }
             }
             // If submit_review wasn't called (unlikely with tool_choice: required, but possible if model loops on deletes), handle gracefully
-            if (!response.summary && !response.deleteCommentIds?.length) {
+            if (!response.summary && !response.deleteCommentIds?.length && !response.minimizeCommentIds?.length) {
                 // Fallback or warning could go here, but for now we trust the model to behave
                 core.warning("AI did not submit a review summary.");
             }
@@ -36837,6 +36881,7 @@ class GitHubService {
                     type: "issue",
                     isOutdated: false,
                     isSummary,
+                    isMinimized: false, // Issue comments don't get minimized via API
                 });
             }
         }
@@ -36854,6 +36899,8 @@ class GitHubService {
                     type: "review",
                     isOutdated,
                     isSummary: false,
+                    // @ts-ignore - GitHub API may include this field
+                    isMinimized: comment.isMinimized || false,
                 });
             }
         }
@@ -36870,6 +36917,58 @@ class GitHubService {
         }
         catch (error) {
             core.warning(`Failed to delete review comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+    /**
+     * Minimize (hide) a comment instead of deleting it
+     */
+    async minimizeComment(commentId, nodeId, classifier = "OUTDATED") {
+        try {
+            // If nodeId is not provided, we need to fetch it
+            if (!nodeId) {
+                // Try to get it from review comment first
+                try {
+                    const { data: comment } = await this.octokit.rest.pulls.getReviewComment({
+                        ...this.repo,
+                        comment_id: commentId,
+                    });
+                    // @ts-ignore - node_id exists but not in types
+                    nodeId = comment.node_id;
+                }
+                catch {
+                    // If not a review comment, try issue comment
+                    const { data: comment } = await this.octokit.rest.issues.getComment({
+                        ...this.repo,
+                        comment_id: commentId,
+                    });
+                    nodeId = comment.node_id;
+                }
+            }
+            if (!nodeId) {
+                core.warning(`Could not find node_id for comment ${commentId}`);
+                return false;
+            }
+            // Use GraphQL to minimize the comment
+            const mutation = `
+        mutation MinimizeComment($subjectId: ID!, $classifier: ReportedContentClassifiers!) {
+          minimizeComment(input: { subjectId: $subjectId, classifier: $classifier }) {
+            minimizedComment {
+              isMinimized
+              minimizedReason
+            }
+          }
+        }
+      `;
+            await this.octokit.graphql(mutation, {
+                subjectId: nodeId,
+                classifier: classifier,
+            });
+            core.info(`✓ Minimized comment ${commentId} (reason: ${classifier})`);
+            return true;
+        }
+        catch (error) {
+            core.warning(`Failed to minimize comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            return false;
         }
     }
     /**
@@ -36894,6 +36993,36 @@ class GitHubService {
                 await this.deleteReviewComment(commentId);
             }
         }
+    }
+    /**
+     * Minimize (hide) multiple comments
+     */
+    async minimizeComments(commentIds, prNumber, classifier = "OUTDATED") {
+        if (commentIds.length === 0) {
+            return 0;
+        }
+        core.info(`🔽 Minimizing ${commentIds.length} comment(s) as ${classifier}...`);
+        const allComments = await this.listBotComments(prNumber);
+        let successCount = 0;
+        for (const commentId of commentIds) {
+            const comment = allComments.find(c => c.id === commentId);
+            if (!comment) {
+                core.warning(`Comment ${commentId} not found, skipping`);
+                continue;
+            }
+            // Only minimize review comments (inline comments)
+            // Issue comments cannot be minimized via API in the same way
+            if (comment.type === "review") {
+                const success = await this.minimizeComment(commentId, undefined, classifier);
+                if (success)
+                    successCount++;
+            }
+            else {
+                core.info(`Skipping issue comment ${commentId} (cannot minimize issue comments)`);
+            }
+        }
+        core.info(`✓ Successfully minimized ${successCount}/${commentIds.length} comments`);
+        return successCount;
     }
     /**
      * Delete all previous summary comments

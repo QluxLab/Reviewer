@@ -164,9 +164,19 @@ async function run(): Promise<void> {
     core.info("🤖 Requesting review from AI...");
     const review = await aiService.getReview(diff, existingComments, previousSummaries, customInstructions);
 
-    // 6. Delete Outdated Comments (as requested by AI)
+    // 6. Minimize Outdated Comments (as requested by AI)
+    if (review.minimizeCommentIds && review.minimizeCommentIds.length > 0) {
+      const minimizedCount = await githubService.minimizeComments(
+        review.minimizeCommentIds,
+        prNumber,
+        "OUTDATED"
+      );
+      core.info(`✓ Minimized ${minimizedCount} outdated comment(s)`);
+    }
+
+    // 7. Delete Comments (as requested by AI - use sparingly)
     if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
-      core.info(`🗑️  Deleting ${review.deleteCommentIds.length} outdated comments...`);
+      core.info(`🗑️  Deleting ${review.deleteCommentIds.length} comment(s)...`);
 
       for (const commentId of review.deleteCommentIds) {
         try {
@@ -194,7 +204,7 @@ async function run(): Promise<void> {
       }
     }
 
-    // 7. Post Review with Summary and Inline Comments
+    // 8. Post Review with Summary and Inline Comments
     const validComments = review.comments?.filter((c) =>
       filesToReview.includes(c.file),
     ) || [];
@@ -251,11 +261,13 @@ async function run(): Promise<void> {
     core.info("✅ Review completed successfully!");
     core.info(`📋 Summary length: ${review.summary.length} characters`);
     core.info(`💬 Inline comments posted: ${filteredComments.length}`);
+    core.info(`🔽 Comments minimized: ${review.minimizeCommentIds?.length || 0}`);
     core.info(`🗑️  Comments deleted: ${review.deleteCommentIds?.length || 0}`);
 
     // Set outputs for workflow
     core.setOutput("summary", review.summary);
     core.setOutput("comments_count", filteredComments.length);
+    core.setOutput("minimized_comments_count", review.minimizeCommentIds?.length || 0);
     core.setOutput("deleted_comments_count", review.deleteCommentIds?.length || 0);
     core.setOutput("severity_distribution", JSON.stringify(severityCounts));
 
