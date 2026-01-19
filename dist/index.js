@@ -36775,7 +36775,7 @@ class GitHubService {
         const lines = summary.split("\n");
         const formattedLines = lines.map(line => `> ${line}`);
         core.info(summary);
-        return summary; // `# 📋 PR Summary\n\n> [!NOTE]\n${formattedLines.join("\n")}`;
+        return `# 📋 PR Summary\n\n> [!NOTE]\n${formattedLines.join("\n")}`;
     }
     async getPullRequestDiff(prNumber) {
         const { data: diff } = await this.octokit.rest.pulls.get({
