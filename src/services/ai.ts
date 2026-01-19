@@ -315,7 +315,7 @@ Use the available tools to submit your review and manage comments.
             properties: {
               summary: {
                 type: "string",
-                description: "Brief markdown summary of what this PR does and overall assessment (2-4 sentences). DO NOT include detailed issues here.",
+                description: "Brief markdown summary of what this PR does and overall assessment (2-4 sentences). DO NOT include detailed issues here. Return ONLY the summary, nothing else.",
               },
               // Only include 'comments' field if inline comments are NOT disabled
               ...(!this.config.disableInline
