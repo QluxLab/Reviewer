@@ -36170,7 +36170,7 @@ async function run() {
         }
         // 5. Get AI Review (with previous summaries for context)
         core.info("🤖 Requesting review from AI...");
-        const review = await aiService.getReview(diff, existingComments, previousSummaries, customInstructions);
+        const review = await aiService.getReview(diff, existingComments, [], customInstructions);
         // 6. Minimize Outdated Comments (as requested by AI)
         if (review.minimizeCommentIds && review.minimizeCommentIds.length > 0) {
             const minimizedCount = await githubService.minimizeComments(review.minimizeCommentIds, prNumber, "OUTDATED");
@@ -36580,7 +36580,7 @@ Use the available tools to submit your review and manage comments.
                         properties: {
                             summary: {
                                 type: "string",
-                                description: "Brief markdown summary of what this PR does and overall assessment (2-4 sentences). DO NOT include detailed issues here.",
+                                description: "Brief markdown summary of what this PR does and overall assessment (2-4 sentences). DO NOT include detailed issues here. Return ONLY the summary, nothing else.",
                             },
                             // Only include 'comments' field if inline comments are NOT disabled
                             ...(!this.config.disableInline
@@ -36774,7 +36774,8 @@ class GitHubService {
         // Clean format with markdown header and NOTE alert
         const lines = summary.split("\n");
         const formattedLines = lines.map(line => `> ${line}`);
-        return `# 📋 PR Summary\n\n> [!NOTE]\n${formattedLines.join("\n")}`;
+        core.info(summary);
+        return summary; // `# 📋 PR Summary\n\n> [!NOTE]\n${formattedLines.join("\n")}`;
     }
     async getPullRequestDiff(prNumber) {
         const { data: diff } = await this.octokit.rest.pulls.get({
