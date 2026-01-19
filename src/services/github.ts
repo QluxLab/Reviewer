@@ -60,7 +60,7 @@ export class GitHubService {
     // Clean format with markdown header and NOTE alert
     const lines = summary.split("\n");
     const formattedLines = lines.map(line => `> ${line}`);
-
+    core.info(summary);
     return `# 📋 PR Summary\n\n> [!NOTE]\n${formattedLines.join("\n")}`;
   }
 
