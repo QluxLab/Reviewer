@@ -36065,21 +36065,17 @@ async function run() {
             core.info(`📋 Processing PR #${prNumber} (${payload.action})`);
         }
         else if (eventName === "pull_request_review_comment") {
-            // Handle user replies to AI comments
             if (payload.action !== "created")
                 return;
             const comment = payload.comment;
             const pr = payload.pull_request;
             prNumber = pr.number;
-            // Avoid infinite loops - don't reply to our own comments
             if (comment.user.login === "github-actions[bot]") {
                 core.info("Skipping bot's own comment");
                 return;
             }
             core.info(`💬 Processing reply in PR #${prNumber} from @${comment.user.login}`);
-            // Fetch the diff for context
             const diff = await githubService.getPullRequestDiff(prNumber);
-            // Fetch the full comment thread
             core.info("🔍 Fetching comment thread for context...");
             let threadComments = [];
             try {
@@ -36089,7 +36085,6 @@ async function run() {
             catch (error) {
                 core.warning(`Failed to fetch comment thread: ${error instanceof Error ? error.message : "Unknown error"}`);
             }
-            // If thread fetching failed, fallback to single comment
             if (threadComments.length === 0) {
                 threadComments = [
                     {
@@ -36115,7 +36110,6 @@ async function run() {
                 core.info("Comment is not a /review command. Skipping.");
                 return;
             }
-            // Ensure it's a PR comment, not just an Issue comment
             if (!payload.issue.pull_request) {
                 core.info("Comment is on an Issue, not a PR. Skipping.");
                 return;
@@ -36126,7 +36120,6 @@ async function run() {
             if (customInstructions) {
                 core.info(`📝 Custom instructions: ${customInstructions.substring(0, 100)}...`);
             }
-            // Post a reaction to acknowledge the command
             await githubService.postComment(prNumber, "👀 AI Review started...");
         }
         else {
@@ -36152,31 +36145,39 @@ async function run() {
         core.info("📥 Fetching PR diff...");
         const diff = await githubService.getPullRequestDiff(prNumber);
         core.info(`📊 Diff size: ${diff.length} characters`);
-        // 4. Fetch Existing Comments for Context
+        // 4. Fetch Existing Comments for Context and Deduplication
         core.info("💬 Fetching existing bot comments...");
         const existingComments = await githubService.listBotComments(prNumber);
-        // Extract previous summaries for AI context
-        const previousSummaries = existingComments
-            .filter(c => c.isSummary)
-            .map(c => c.body);
+        // Build a set of existing inline comment locations for deduplication
+        const existingInlineKeys = new Set();
+        const existingInlineComments = existingComments.filter(c => !c.isSummary);
+        for (const comment of existingInlineComments) {
+            if (comment.path && comment.line) {
+                const key = `${comment.path}:${comment.line}`;
+                existingInlineKeys.add(key);
+                core.debug(`📍 Existing comment at: ${key}`);
+            }
+        }
+        if (existingInlineKeys.size > 0) {
+            core.info(`📌 Found ${existingInlineKeys.size} existing inline comment location(s)`);
+        }
         // Delete all previous summaries before creating new one
         const deletedSummariesCount = await githubService.deletePreviousSummaries(prNumber);
         if (deletedSummariesCount > 0) {
             core.info(`🧹 Cleaned up ${deletedSummariesCount} previous summary comment(s)`);
         }
-        // If it's a synchronize event (new commit), we keep existing comments for context
         if (eventName === "pull_request" && payload.action === "synchronize") {
-            core.info("🔄 Synchronize event: Using existing comments for consistency and deduplication");
+            core.info("🔄 Synchronize event: Will deduplicate against existing comments");
         }
-        // 5. Get AI Review (with previous summaries for context)
+        // 5. Get AI Review
         core.info("🤖 Requesting review from AI...");
         const review = await aiService.getReview(diff, existingComments, [], customInstructions);
-        // 6. Minimize Outdated Comments (as requested by AI)
+        // 6. Minimize Outdated Comments
         if (review.minimizeCommentIds && review.minimizeCommentIds.length > 0) {
             const minimizedCount = await githubService.minimizeComments(review.minimizeCommentIds, prNumber, "OUTDATED");
             core.info(`✓ Minimized ${minimizedCount} outdated comment(s)`);
         }
-        // 7. Delete Comments (as requested by AI - use sparingly)
+        // 7. Delete Comments
         if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
             core.info(`🗑️  Deleting ${review.deleteCommentIds.length} comment(s)...`);
             for (const commentId of review.deleteCommentIds) {
@@ -36192,7 +36193,6 @@ async function run() {
                         core.info(`  ✓ Deleted ${commentInfo.type} comment #${commentId}`);
                     }
                     else {
-                        // Fallback if not found in our cache
                         try {
                             await githubService.deleteReviewComment(commentId);
                             core.info(`  ✓ Deleted review comment #${commentId}`);
@@ -36208,15 +36208,27 @@ async function run() {
                 }
             }
         }
-        // 8. Post Review with Summary and Inline Comments
+        // 8. Process and Deduplicate Comments
         const validComments = review.comments?.filter((c) => filesToReview.includes(c.file)) || [];
-        // Filter comments based on severity
+        // Filter by severity
         const minSeverityLevel = (0, utils_1.getSeverityLevel)(config.minSeverity);
         const filteredComments = validComments.filter((c) => (0, utils_1.getSeverityLevel)(c.severity) >= minSeverityLevel);
-        // Log filtering results
-        const filteredCount = validComments.length - filteredComments.length;
-        if (filteredCount > 0) {
-            core.info(`⚠️  Filtered ${filteredCount} comments below ${config.minSeverity} severity level`);
+        const severityFilteredCount = validComments.length - filteredComments.length;
+        if (severityFilteredCount > 0) {
+            core.info(`⚠️  Filtered ${severityFilteredCount} comments below ${config.minSeverity} severity level`);
+        }
+        // DEDUPLICATION: Filter out comments at existing locations
+        const deduplicatedComments = filteredComments.filter(c => {
+            const key = `${c.file}:${c.line}`;
+            if (existingInlineKeys.has(key)) {
+                core.info(`⏭️  Skipping duplicate comment at ${key}`);
+                return false;
+            }
+            return true;
+        });
+        const duplicateCount = filteredComments.length - deduplicatedComments.length;
+        if (duplicateCount > 0) {
+            core.info(`🔄 Skipped ${duplicateCount} duplicate comment(s) at existing locations`);
         }
         // Log severity distribution
         const severityCounts = {
@@ -36229,30 +36241,28 @@ async function run() {
             severityCounts[c.severity]++;
         });
         core.info(`📊 Severity distribution: ${JSON.stringify(severityCounts)}`);
-        if (filteredComments.length > 0) {
-            core.info(`💡 Posting ${filteredComments.length} inline comments (${config.minSeverity}+ severity)`);
+        if (deduplicatedComments.length > 0) {
+            core.info(`💡 Posting ${deduplicatedComments.length} new inline comments`);
         }
-        // Get PR head SHA for the review
+        // 9. Post Review
         const commitId = await githubService.getPRHeadSHA(prNumber);
-        // Convert comments from AIReviewResponse format to GitHubService format
-        // AIReviewResponse uses 'file', but createReview expects 'path'
-        const formattedComments = filteredComments.map(c => ({
+        const formattedComments = deduplicatedComments.map(c => ({
             path: c.file,
             line: c.line,
             body: c.body,
             severity: c.severity
         }));
-        // Post the complete review (summary + inline comments)
         await githubService.createReview(prNumber, commitId, review.summary, config.disableInline ? undefined : formattedComments);
-        // Summary of the review
+        // 10. Summary
         core.info("✅ Review completed successfully!");
         core.info(`📋 Summary length: ${review.summary.length} characters`);
-        core.info(`💬 Inline comments posted: ${filteredComments.length}`);
+        core.info(`💬 Inline comments posted: ${deduplicatedComments.length}`);
+        core.info(`🔄 Duplicate comments skipped: ${duplicateCount}`);
         core.info(`🔽 Comments minimized: ${review.minimizeCommentIds?.length || 0}`);
         core.info(`🗑️  Comments deleted: ${review.deleteCommentIds?.length || 0}`);
-        // Set outputs for workflow
         core.setOutput("summary", review.summary);
-        core.setOutput("comments_count", filteredComments.length);
+        core.setOutput("comments_count", deduplicatedComments.length);
+        core.setOutput("duplicates_skipped", duplicateCount);
         core.setOutput("minimized_comments_count", review.minimizeCommentIds?.length || 0);
         core.setOutput("deleted_comments_count", review.deleteCommentIds?.length || 0);
         core.setOutput("severity_distribution", JSON.stringify(severityCounts));
@@ -36731,375 +36741,410 @@ const core = __importStar(__nccwpck_require__(7484));
 class GitHubService {
     constructor(token) {
         this.octokit = github.getOctokit(token);
-        this.context = github.context;
-    }
-    get repo() {
-        return this.context.repo;
-    }
-    /**
-     * Map severity to GitHub Alert type
-     */
-    getAlertType(severity) {
-        const alertMap = {
-            critical: "CAUTION",
-            high: "WARNING",
-            medium: "IMPORTANT",
-            low: "TIP",
-        };
-        return alertMap[severity] || "NOTE";
+        const { owner, repo } = github.context.repo;
+        this.owner = owner;
+        this.repo = repo;
     }
     /**
-     * Format inline comment body with GitHub Alert syntax
+     * Get list of changed files in a PR
      */
-    formatInlineComment(body, severity) {
-        // If the body already starts with an alert, return as-is
-        if (body.trim().startsWith("> [!")) {
-            return body;
+    async getChangedFiles(prNumber) {
+        const files = [];
+        let page = 1;
+        while (true) {
+            const response = await this.octokit.rest.pulls.listFiles({
+                owner: this.owner,
+                repo: this.repo,
+                pull_number: prNumber,
+                per_page: 100,
+                page,
+            });
+            for (const file of response.data) {
+                files.push(file.filename);
+            }
+            if (response.data.length < 100)
+                break;
+            page++;
         }
-        // Otherwise, wrap it in the appropriate alert based on severity
-        const alertType = this.getAlertType(severity);
-        // Split body into lines and format each line with quote syntax
-        const lines = body.split("\n");
-        const formattedLines = lines.map(line => `> ${line}`);
-        return `> [!${alertType}]\n${formattedLines.join("\n")}`;
+        return files;
     }
     /**
-     * Format summary with GitHub Alert NOTE syntax
+     * Get PR diff
      */
-    formatSummary(summary) {
-        // If the summary already starts with an alert, return as-is
-        if (summary.trim().startsWith("> [!")) {
-            return summary;
-        }
-        // Clean format with markdown header and NOTE alert
-        const lines = summary.split("\n");
-        const formattedLines = lines.map(line => `> ${line}`);
-        core.info(summary);
-        return `# 📋 PR Summary\n\n> [!NOTE]\n${formattedLines.join("\n")}`;
-    }
     async getPullRequestDiff(prNumber) {
-        const { data: diff } = await this.octokit.rest.pulls.get({
-            ...this.repo,
+        const response = await this.octokit.rest.pulls.get({
+            owner: this.owner,
+            repo: this.repo,
             pull_number: prNumber,
             mediaType: {
                 format: "diff",
             },
         });
-        // @ts-ignore - The type definition doesn't always reflect that data is string for mediaType diff
-        return diff;
+        return response.data;
     }
+    /**
+     * Get PR head SHA
+     */
+    async getPRHeadSHA(prNumber) {
+        const response = await this.octokit.rest.pulls.get({
+            owner: this.owner,
+            repo: this.repo,
+            pull_number: prNumber,
+        });
+        return response.data.head.sha;
+    }
+    /**
+     * Post a general comment on PR
+     */
     async postComment(prNumber, body) {
-        await this.octokit.rest.issues.createComment({
-            ...this.repo,
+        const response = await this.octokit.rest.issues.createComment({
+            owner: this.owner,
+            repo: this.repo,
             issue_number: prNumber,
             body,
         });
+        return response.data.id;
     }
     /**
-     * Create a review with summary and optional inline comments
+     * Create a review with summary and inline comments
      */
     async createReview(prNumber, commitId, summary, comments) {
-        const formattedComments = comments?.map((c) => ({
+        const reviewComments = comments?.map(c => ({
             path: c.path,
             line: c.line,
-            body: this.formatInlineComment(c.body, c.severity),
-        }));
-        // Post summary as a separate issue comment (so it can be deleted easily)
-        const formattedSummary = this.formatSummary(summary);
-        await this.postComment(prNumber, formattedSummary);
-        // Post inline comments as a review (without body)
-        if (formattedComments && formattedComments.length > 0) {
+            body: this.formatCommentBody(c.body, c.severity),
+        })) || [];
+        try {
             await this.octokit.rest.pulls.createReview({
-                ...this.repo,
+                owner: this.owner,
+                repo: this.repo,
                 pull_number: prNumber,
                 commit_id: commitId,
+                body: summary,
                 event: "COMMENT",
-                comments: formattedComments,
+                comments: reviewComments,
             });
-        }
-        core.info(`Review posted with summary and ${formattedComments?.length || 0} inline comments`);
-    }
-    async getChangedFiles(prNumber) {
-        const { data: files } = await this.octokit.rest.pulls.listFiles({
-            ...this.repo,
-            pull_number: prNumber,
-        });
-        return files.map((f) => f.filename);
-    }
-    async getPRDetails(prNumber) {
-        const { data: pr } = await this.octokit.rest.pulls.get({
-            ...this.repo,
-            pull_number: prNumber,
-        });
-        return pr;
-    }
-    async getAuthenticatedUser() {
-        // Strictly return github-actions[bot] as requested
-        return {
-            login: "github-actions[bot]",
-            id: -1,
-        };
-    }
-    async listComments(prNumber) {
-        const { data: comments } = await this.octokit.rest.issues.listComments({
-            ...this.repo,
-            issue_number: prNumber,
-        });
-        return comments;
-    }
-    async deleteComment(commentId) {
-        try {
-            await this.octokit.rest.issues.deleteComment({
-                ...this.repo,
-                comment_id: commentId,
-            });
-            core.info(`Deleted issue comment ${commentId}`);
         }
         catch (error) {
-            core.warning(`Failed to delete issue comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
-    }
-    async listReviewComments(prNumber) {
-        const { data: comments } = await this.octokit.rest.pulls.listReviewComments({
-            ...this.repo,
-            pull_number: prNumber,
-        });
-        return comments;
-    }
-    async listBotComments(prNumber) {
-        const botUser = await this.getAuthenticatedUser();
-        const result = [];
-        // 1. Issue Comments (General)
-        // Issue comments are generally "active" unless manually minimized, but we treat them as active here.
-        const issueComments = await this.listComments(prNumber);
-        for (const comment of issueComments) {
-            if (comment.user?.login === botUser.login) {
-                // Check if this is a summary comment (contains "# 📋 PR Summary" or old format)
-                const isSummary = comment.body?.includes("# 📋 PR Summary") ||
-                    (comment.body?.includes("> [!NOTE]") && comment.body?.includes("**AI Review Summary**"));
-                result.push({
-                    id: comment.id,
-                    body: comment.body || "",
-                    type: "issue",
-                    isOutdated: false,
-                    isSummary,
-                    isMinimized: false, // Issue comments don't get minimized via API
-                });
-            }
-        }
-        // 2. Review Comments (Inline)
-        const reviewComments = await this.listReviewComments(prNumber);
-        for (const comment of reviewComments) {
-            if (comment.user?.login === botUser.login) {
-                // A review comment is outdated if it has no position in the current diff
-                const isOutdated = comment.position === null;
-                result.push({
-                    id: comment.id,
-                    body: comment.body,
-                    path: comment.path,
-                    line: comment.line || comment.original_line || undefined,
-                    type: "review",
-                    isOutdated,
-                    isSummary: false,
-                    // @ts-ignore - GitHub API may include this field
-                    isMinimized: comment.isMinimized || false,
-                });
-            }
-        }
-        core.info(`Found ${result.length} bot comments (${result.filter(c => !c.isOutdated).length} active, ${result.filter(c => c.isOutdated).length} outdated, ${result.filter(c => c.isSummary).length} summaries)`);
-        return result;
-    }
-    async deleteReviewComment(commentId) {
-        try {
-            await this.octokit.rest.pulls.deleteReviewComment({
-                ...this.repo,
-                comment_id: commentId,
-            });
-            core.info(`Deleted review comment ${commentId}`);
-        }
-        catch (error) {
-            core.warning(`Failed to delete review comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
-    }
-    /**
-     * Minimize (hide) a comment instead of deleting it
-     */
-    async minimizeComment(commentId, nodeId, classifier = "OUTDATED") {
-        try {
-            // If nodeId is not provided, we need to fetch it
-            if (!nodeId) {
-                // Try to get it from review comment first
+            core.warning(`Batch review failed, falling back to individual comments: ${error}`);
+            await this.postComment(prNumber, summary);
+            for (const comment of reviewComments) {
                 try {
-                    const { data: comment } = await this.octokit.rest.pulls.getReviewComment({
-                        ...this.repo,
-                        comment_id: commentId,
+                    await this.octokit.rest.pulls.createReviewComment({
+                        owner: this.owner,
+                        repo: this.repo,
+                        pull_number: prNumber,
+                        commit_id: commitId,
+                        path: comment.path,
+                        line: comment.line,
+                        body: comment.body,
                     });
-                    // @ts-ignore - node_id exists but not in types
-                    nodeId = comment.node_id;
                 }
-                catch {
-                    // If not a review comment, try issue comment
-                    const { data: comment } = await this.octokit.rest.issues.getComment({
-                        ...this.repo,
-                        comment_id: commentId,
-                    });
-                    nodeId = comment.node_id;
+                catch (commentError) {
+                    core.warning(`Failed to post comment on ${comment.path}:${comment.line}: ${commentError}`);
                 }
             }
-            if (!nodeId) {
-                core.warning(`Could not find node_id for comment ${commentId}`);
-                return false;
-            }
-            // Use GraphQL to minimize the comment
-            const mutation = `
-        mutation MinimizeComment($subjectId: ID!, $classifier: ReportedContentClassifiers!) {
-          minimizeComment(input: { subjectId: $subjectId, classifier: $classifier }) {
-            minimizedComment {
-              isMinimized
-              minimizedReason
-            }
-          }
         }
-      `;
-            await this.octokit.graphql(mutation, {
-                subjectId: nodeId,
-                classifier: classifier,
+    }
+    /**
+     * Format comment body with severity indicator
+     */
+    formatCommentBody(body, severity) {
+        const severityIcons = {
+            low: "📝",
+            medium: "⚠️",
+            high: "🔴",
+            critical: "🚨",
+        };
+        const icon = severityIcons[severity.toLowerCase()] || "💡";
+        const severityLabel = severity.charAt(0).toUpperCase() + severity.slice(1);
+        return `${icon} **${severityLabel}**\n\n${body}`;
+    }
+    /**
+     * List all bot comments on a PR
+     */
+    async listBotComments(prNumber) {
+        const botComments = [];
+        // Fetch issue comments (general PR comments)
+        try {
+            const issueComments = await this.octokit.rest.issues.listComments({
+                owner: this.owner,
+                repo: this.repo,
+                issue_number: prNumber,
+                per_page: 100,
             });
-            core.info(`✓ Minimized comment ${commentId} (reason: ${classifier})`);
-            return true;
+            for (const comment of issueComments.data) {
+                if (comment.user?.login === "github-actions[bot]") {
+                    botComments.push({
+                        id: comment.id,
+                        body: comment.body || "",
+                        isSummary: this.isSummaryComment(comment.body || ""),
+                        isOutdated: false, // Issue comments don't have outdated status
+                        isMinimized: false,
+                        type: 'issue',
+                        path: undefined,
+                        line: undefined,
+                        createdAt: comment.created_at,
+                    });
+                }
+            }
         }
         catch (error) {
-            core.warning(`Failed to minimize comment ${commentId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-            return false;
+            core.warning(`Failed to fetch issue comments: ${error}`);
         }
+        // Fetch review comments (inline comments on code)
+        try {
+            const reviewComments = await this.octokit.rest.pulls.listReviewComments({
+                owner: this.owner,
+                repo: this.repo,
+                pull_number: prNumber,
+                per_page: 100,
+            });
+            for (const comment of reviewComments.data) {
+                if (comment.user?.login === "github-actions[bot]") {
+                    // Check if comment is outdated (line no longer exists in current diff)
+                    const isOutdated = comment.position === null || comment.line === null;
+                    botComments.push({
+                        id: comment.id,
+                        body: comment.body || "",
+                        isSummary: false,
+                        isOutdated: isOutdated,
+                        isMinimized: false, // GitHub API doesn't directly expose this
+                        type: 'review',
+                        path: comment.path,
+                        line: comment.line ?? comment.original_line ?? undefined,
+                        createdAt: comment.created_at,
+                    });
+                }
+            }
+        }
+        catch (error) {
+            core.warning(`Failed to fetch review comments: ${error}`);
+        }
+        return botComments;
     }
     /**
-     * Delete multiple comments (both issue and review comments)
+     * Check if a comment is a summary comment
      */
-    async deleteComments(commentIds, prNumber) {
-        if (commentIds.length === 0) {
-            return;
-        }
-        core.info(`Deleting ${commentIds.length} comments...`);
-        const allComments = await this.listBotComments(prNumber);
-        for (const commentId of commentIds) {
-            const comment = allComments.find(c => c.id === commentId);
-            if (!comment) {
-                core.warning(`Comment ${commentId} not found, skipping deletion`);
-                continue;
-            }
-            if (comment.type === "issue") {
-                await this.deleteComment(commentId);
-            }
-            else {
-                await this.deleteReviewComment(commentId);
-            }
-        }
+    isSummaryComment(body) {
+        return body.includes("📋 PR Summary") ||
+            body.includes("## Summary") ||
+            body.includes("# Review") ||
+            body.includes("**Summary**") ||
+            body.startsWith("## ") ||
+            body.includes("review completed");
     }
     /**
-     * Minimize (hide) multiple comments
-     */
-    async minimizeComments(commentIds, prNumber, classifier = "OUTDATED") {
-        if (commentIds.length === 0) {
-            return 0;
-        }
-        core.info(`🔽 Minimizing ${commentIds.length} comment(s) as ${classifier}...`);
-        const allComments = await this.listBotComments(prNumber);
-        let successCount = 0;
-        for (const commentId of commentIds) {
-            const comment = allComments.find(c => c.id === commentId);
-            if (!comment) {
-                core.warning(`Comment ${commentId} not found, skipping`);
-                continue;
-            }
-            // Only minimize review comments (inline comments)
-            // Issue comments cannot be minimized via API in the same way
-            if (comment.type === "review") {
-                const success = await this.minimizeComment(commentId, undefined, classifier);
-                if (success)
-                    successCount++;
-            }
-            else {
-                core.info(`Skipping issue comment ${commentId} (cannot minimize issue comments)`);
-            }
-        }
-        core.info(`✓ Successfully minimized ${successCount}/${commentIds.length} comments`);
-        return successCount;
-    }
-    /**
-     * Delete all previous summary comments
+     * Delete previous summary comments
      */
     async deletePreviousSummaries(prNumber) {
-        const allComments = await this.listBotComments(prNumber);
-        const summaries = allComments.filter(c => c.isSummary);
-        if (summaries.length === 0) {
-            return 0;
-        }
-        core.info(`🗑️  Deleting ${summaries.length} previous summary comment(s)...`);
+        const botComments = await this.listBotComments(prNumber);
+        const summaries = botComments.filter(c => c.isSummary);
+        let deletedCount = 0;
         for (const summary of summaries) {
-            await this.deleteComment(summary.id);
+            try {
+                if (summary.type === 'issue') {
+                    await this.deleteComment(summary.id);
+                }
+                else {
+                    await this.deleteReviewComment(summary.id);
+                }
+                deletedCount++;
+            }
+            catch (error) {
+                core.warning(`Failed to delete summary comment ${summary.id}: ${error}`);
+            }
         }
-        return summaries.length;
+        return deletedCount;
     }
+    /**
+     * Delete an issue comment
+     */
+    async deleteComment(commentId) {
+        await this.octokit.rest.issues.deleteComment({
+            owner: this.owner,
+            repo: this.repo,
+            comment_id: commentId,
+        });
+    }
+    /**
+     * Delete a review comment
+     */
+    async deleteReviewComment(commentId) {
+        await this.octokit.rest.pulls.deleteReviewComment({
+            owner: this.owner,
+            repo: this.repo,
+            comment_id: commentId,
+        });
+    }
+    /**
+     * Minimize comments (collapse them)
+     */
+    async minimizeComments(commentIds, prNumber, reason = "OUTDATED") {
+        let minimizedCount = 0;
+        for (const commentId of commentIds) {
+            try {
+                const nodeId = await this.getCommentNodeId(commentId, prNumber);
+                if (nodeId) {
+                    await this.octokit.graphql(`
+            mutation MinimizeComment($id: ID!, $classifier: ReportedContentClassifiers!) {
+              minimizeComment(input: {subjectId: $id, classifier: $classifier}) {
+                minimizedComment {
+                  isMinimized
+                }
+              }
+            }
+          `, {
+                        id: nodeId,
+                        classifier: reason,
+                    });
+                    minimizedCount++;
+                }
+            }
+            catch (error) {
+                core.warning(`Failed to minimize comment ${commentId}: ${error}`);
+            }
+        }
+        return minimizedCount;
+    }
+    /**
+     * Get comment node ID for GraphQL operations
+     */
+    async getCommentNodeId(commentId, prNumber) {
+        try {
+            const issueComment = await this.octokit.rest.issues.getComment({
+                owner: this.owner,
+                repo: this.repo,
+                comment_id: commentId,
+            });
+            return issueComment.data.node_id;
+        }
+        catch {
+            try {
+                const reviewComment = await this.octokit.rest.pulls.getReviewComment({
+                    owner: this.owner,
+                    repo: this.repo,
+                    comment_id: commentId,
+                });
+                return reviewComment.data.node_id;
+            }
+            catch {
+                return null;
+            }
+        }
+    }
+    /**
+     * Create a reply to a review comment
+     */
     async createReply(prNumber, commentId, body) {
         await this.octokit.rest.pulls.createReplyForReviewComment({
-            ...this.repo,
+            owner: this.owner,
+            repo: this.repo,
             pull_number: prNumber,
             comment_id: commentId,
             body,
         });
     }
+    /**
+     * Get comment thread for context
+     */
     async getCommentThread(prNumber, commentId) {
+        const thread = [];
         try {
-            // Fetch the specific comment to get its position in the thread
-            const { data: comment } = await this.octokit.rest.pulls.getReviewComment({
-                ...this.repo,
-                pull_number: prNumber,
+            const comment = await this.octokit.rest.pulls.getReviewComment({
+                owner: this.owner,
+                repo: this.repo,
                 comment_id: commentId,
             });
-            // Get all review comments for the PR
-            const { data: allComments } = await this.octokit.rest.pulls.listReviewComments({
-                ...this.repo,
+            const allComments = await this.octokit.rest.pulls.listReviewComments({
+                owner: this.owner,
+                repo: this.repo,
                 pull_number: prNumber,
+                per_page: 100,
             });
-            // Find comments in the same thread
-            // GitHub uses in_reply_to_id to link replies
-            const threadComments = [];
-            // Find the root comment (the one without in_reply_to_id or the original comment)
-            let rootComment = comment;
-            if (comment.in_reply_to_id) {
-                const root = allComments.find(c => c.id === comment.in_reply_to_id);
-                if (root)
-                    rootComment = root;
-            }
-            // Add root comment
-            threadComments.push(rootComment);
-            // Find all replies to this root comment
-            const replies = allComments.filter(c => c.in_reply_to_id === rootComment.id);
-            threadComments.push(...replies);
-            // Sort by created_at to get chronological order
+            const targetPath = comment.data.path;
+            const targetLine = comment.data.line || comment.data.original_line;
+            const targetInReplyTo = comment.data.in_reply_to_id;
+            let rootId = targetInReplyTo || commentId;
+            const threadComments = allComments.data.filter(c => {
+                return c.id === rootId ||
+                    c.in_reply_to_id === rootId ||
+                    (c.path === targetPath && (c.line === targetLine || c.original_line === targetLine));
+            });
             threadComments.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-            // Get authenticated user to identify bot comments
-            const botUser = await this.getAuthenticatedUser();
-            // Format thread data
-            return threadComments.map(c => ({
-                author: c.user?.login || 'Unknown',
-                body: c.body,
-                isBot: c.user?.login === botUser.login
-            }));
+            for (const c of threadComments) {
+                thread.push({
+                    author: c.user?.login || "unknown",
+                    body: c.body || "",
+                    isBot: c.user?.login === "github-actions[bot]",
+                });
+            }
         }
         catch (error) {
-            core.warning(`Failed to fetch comment thread: ${error instanceof Error ? error.message : 'Unknown error'}`);
-            // Return empty array on failure, caller can handle gracefully
-            return [];
+            core.warning(`Failed to get comment thread: ${error}`);
         }
+        return thread;
     }
     /**
-     * Get commit SHA for the PR head
+     * Update an existing comment
      */
-    async getPRHeadSHA(prNumber) {
-        const pr = await this.getPRDetails(prNumber);
-        return pr.head.sha;
+    async updateComment(commentId, body) {
+        await this.octokit.rest.issues.updateComment({
+            owner: this.owner,
+            repo: this.repo,
+            comment_id: commentId,
+            body,
+        });
+    }
+    /**
+     * Update an existing review comment
+     */
+    async updateReviewComment(commentId, body) {
+        await this.octokit.rest.pulls.updateReviewComment({
+            owner: this.owner,
+            repo: this.repo,
+            comment_id: commentId,
+            body,
+        });
+    }
+    /**
+     * Get PR details
+     */
+    async getPRDetails(prNumber) {
+        const response = await this.octokit.rest.pulls.get({
+            owner: this.owner,
+            repo: this.repo,
+            pull_number: prNumber,
+        });
+        return {
+            title: response.data.title,
+            body: response.data.body || "",
+            author: response.data.user?.login || "unknown",
+            baseBranch: response.data.base.ref,
+            headBranch: response.data.head.ref,
+        };
+    }
+    /**
+     * Add labels to PR
+     */
+    async addLabels(prNumber, labels) {
+        await this.octokit.rest.issues.addLabels({
+            owner: this.owner,
+            repo: this.repo,
+            issue_number: prNumber,
+            labels,
+        });
+    }
+    /**
+     * Add reaction to a comment
+     */
+    async addReaction(commentId, reaction) {
+        await this.octokit.rest.reactions.createForIssueComment({
+            owner: this.owner,
+            repo: this.repo,
+            comment_id: commentId,
+            content: reaction,
+        });
     }
 }
 exports.GitHubService = GitHubService;

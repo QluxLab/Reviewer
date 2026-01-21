@@ -29,14 +29,12 @@ async function run(): Promise<void> {
       prNumber = payload.pull_request!.number;
       core.info(`📋 Processing PR #${prNumber} (${payload.action})`);
     } else if (eventName === "pull_request_review_comment") {
-      // Handle user replies to AI comments
       if (payload.action !== "created") return;
 
       const comment = payload.comment;
       const pr = payload.pull_request;
       prNumber = pr!.number;
 
-      // Avoid infinite loops - don't reply to our own comments
       if (comment!.user.login === "github-actions[bot]") {
         core.info("Skipping bot's own comment");
         return;
@@ -44,10 +42,8 @@ async function run(): Promise<void> {
 
       core.info(`💬 Processing reply in PR #${prNumber} from @${comment!.user.login}`);
 
-      // Fetch the diff for context
       const diff = await githubService.getPullRequestDiff(prNumber);
 
-      // Fetch the full comment thread
       core.info("🔍 Fetching comment thread for context...");
       let threadComments: Array<{ author: string; body: string; isBot: boolean }> = [];
       try {
@@ -55,12 +51,10 @@ async function run(): Promise<void> {
         core.info(`📜 Found ${threadComments.length} messages in thread`);
       } catch (error) {
         core.warning(
-          `Failed to fetch comment thread: ${error instanceof Error ? error.message : "Unknown error"
-          }`
+          `Failed to fetch comment thread: ${error instanceof Error ? error.message : "Unknown error"}`
         );
       }
 
-      // If thread fetching failed, fallback to single comment
       if (threadComments.length === 0) {
         threadComments = [
           {
@@ -89,7 +83,6 @@ async function run(): Promise<void> {
         return;
       }
 
-      // Ensure it's a PR comment, not just an Issue comment
       if (!payload.issue!.pull_request) {
         core.info("Comment is on an Issue, not a PR. Skipping.");
         return;
@@ -103,7 +96,6 @@ async function run(): Promise<void> {
         core.info(`📝 Custom instructions: ${customInstructions.substring(0, 100)}...`);
       }
 
-      // Post a reaction to acknowledge the command
       await githubService.postComment(prNumber, "👀 AI Review started...");
     } else {
       core.info(`Unsupported event: ${eventName}`);
@@ -140,14 +132,25 @@ async function run(): Promise<void> {
     const diff = await githubService.getPullRequestDiff(prNumber);
     core.info(`📊 Diff size: ${diff.length} characters`);
 
-    // 4. Fetch Existing Comments for Context
+    // 4. Fetch Existing Comments for Context and Deduplication
     core.info("💬 Fetching existing bot comments...");
     const existingComments = await githubService.listBotComments(prNumber);
 
-    // Extract previous summaries for AI context
-    const previousSummaries = existingComments
-      .filter(c => c.isSummary)
-      .map(c => c.body);
+    // Build a set of existing inline comment locations for deduplication
+    const existingInlineKeys = new Set<string>();
+    const existingInlineComments = existingComments.filter(c => !c.isSummary);
+
+    for (const comment of existingInlineComments) {
+      if (comment.path && comment.line) {
+        const key = `${comment.path}:${comment.line}`;
+        existingInlineKeys.add(key);
+        core.debug(`📍 Existing comment at: ${key}`);
+      }
+    }
+
+    if (existingInlineKeys.size > 0) {
+      core.info(`📌 Found ${existingInlineKeys.size} existing inline comment location(s)`);
+    }
 
     // Delete all previous summaries before creating new one
     const deletedSummariesCount = await githubService.deletePreviousSummaries(prNumber);
@@ -155,16 +158,15 @@ async function run(): Promise<void> {
       core.info(`🧹 Cleaned up ${deletedSummariesCount} previous summary comment(s)`);
     }
 
-    // If it's a synchronize event (new commit), we keep existing comments for context
     if (eventName === "pull_request" && payload.action === "synchronize") {
-      core.info("🔄 Synchronize event: Using existing comments for consistency and deduplication");
+      core.info("🔄 Synchronize event: Will deduplicate against existing comments");
     }
 
-    // 5. Get AI Review (with previous summaries for context)
+    // 5. Get AI Review
     core.info("🤖 Requesting review from AI...");
     const review = await aiService.getReview(diff, existingComments, [], customInstructions);
 
-    // 6. Minimize Outdated Comments (as requested by AI)
+    // 6. Minimize Outdated Comments
     if (review.minimizeCommentIds && review.minimizeCommentIds.length > 0) {
       const minimizedCount = await githubService.minimizeComments(
         review.minimizeCommentIds,
@@ -174,7 +176,7 @@ async function run(): Promise<void> {
       core.info(`✓ Minimized ${minimizedCount} outdated comment(s)`);
     }
 
-    // 7. Delete Comments (as requested by AI - use sparingly)
+    // 7. Delete Comments
     if (review.deleteCommentIds && review.deleteCommentIds.length > 0) {
       core.info(`🗑️  Deleting ${review.deleteCommentIds.length} comment(s)...`);
 
@@ -189,7 +191,6 @@ async function run(): Promise<void> {
             }
             core.info(`  ✓ Deleted ${commentInfo.type} comment #${commentId}`);
           } else {
-            // Fallback if not found in our cache
             try {
               await githubService.deleteReviewComment(commentId);
               core.info(`  ✓ Deleted review comment #${commentId}`);
@@ -204,21 +205,35 @@ async function run(): Promise<void> {
       }
     }
 
-    // 8. Post Review with Summary and Inline Comments
+    // 8. Process and Deduplicate Comments
     const validComments = review.comments?.filter((c) =>
       filesToReview.includes(c.file),
     ) || [];
 
-    // Filter comments based on severity
+    // Filter by severity
     const minSeverityLevel = getSeverityLevel(config.minSeverity);
     const filteredComments = validComments.filter(
       (c) => getSeverityLevel(c.severity) >= minSeverityLevel,
     );
 
-    // Log filtering results
-    const filteredCount = validComments.length - filteredComments.length;
-    if (filteredCount > 0) {
-      core.info(`⚠️  Filtered ${filteredCount} comments below ${config.minSeverity} severity level`);
+    const severityFilteredCount = validComments.length - filteredComments.length;
+    if (severityFilteredCount > 0) {
+      core.info(`⚠️  Filtered ${severityFilteredCount} comments below ${config.minSeverity} severity level`);
+    }
+
+    // DEDUPLICATION: Filter out comments at existing locations
+    const deduplicatedComments = filteredComments.filter(c => {
+      const key = `${c.file}:${c.line}`;
+      if (existingInlineKeys.has(key)) {
+        core.info(`⏭️  Skipping duplicate comment at ${key}`);
+        return false;
+      }
+      return true;
+    });
+
+    const duplicateCount = filteredComments.length - deduplicatedComments.length;
+    if (duplicateCount > 0) {
+      core.info(`🔄 Skipped ${duplicateCount} duplicate comment(s) at existing locations`);
     }
 
     // Log severity distribution
@@ -233,23 +248,20 @@ async function run(): Promise<void> {
     });
     core.info(`📊 Severity distribution: ${JSON.stringify(severityCounts)}`);
 
-    if (filteredComments.length > 0) {
-      core.info(`💡 Posting ${filteredComments.length} inline comments (${config.minSeverity}+ severity)`);
+    if (deduplicatedComments.length > 0) {
+      core.info(`💡 Posting ${deduplicatedComments.length} new inline comments`);
     }
 
-    // Get PR head SHA for the review
+    // 9. Post Review
     const commitId = await githubService.getPRHeadSHA(prNumber);
 
-    // Convert comments from AIReviewResponse format to GitHubService format
-    // AIReviewResponse uses 'file', but createReview expects 'path'
-    const formattedComments = filteredComments.map(c => ({
+    const formattedComments = deduplicatedComments.map(c => ({
       path: c.file,
       line: c.line,
       body: c.body,
       severity: c.severity
     }));
 
-    // Post the complete review (summary + inline comments)
     await githubService.createReview(
       prNumber,
       commitId,
@@ -257,16 +269,17 @@ async function run(): Promise<void> {
       config.disableInline ? undefined : formattedComments
     );
 
-    // Summary of the review
+    // 10. Summary
     core.info("✅ Review completed successfully!");
     core.info(`📋 Summary length: ${review.summary.length} characters`);
-    core.info(`💬 Inline comments posted: ${filteredComments.length}`);
+    core.info(`💬 Inline comments posted: ${deduplicatedComments.length}`);
+    core.info(`🔄 Duplicate comments skipped: ${duplicateCount}`);
     core.info(`🔽 Comments minimized: ${review.minimizeCommentIds?.length || 0}`);
     core.info(`🗑️  Comments deleted: ${review.deleteCommentIds?.length || 0}`);
 
-    // Set outputs for workflow
     core.setOutput("summary", review.summary);
-    core.setOutput("comments_count", filteredComments.length);
+    core.setOutput("comments_count", deduplicatedComments.length);
+    core.setOutput("duplicates_skipped", duplicateCount);
     core.setOutput("minimized_comments_count", review.minimizeCommentIds?.length || 0);
     core.setOutput("deleted_comments_count", review.deleteCommentIds?.length || 0);
     core.setOutput("severity_distribution", JSON.stringify(severityCounts));
