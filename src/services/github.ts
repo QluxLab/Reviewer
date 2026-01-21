@@ -109,48 +109,57 @@ export class GitHubService {
   }
 
   /**
-   * Create a review with summary and inline comments
-   */
+ * Create a review with summary and inline comments
+ * Summary is posted as a separate issue comment (not review comment)
+ * Inline comments are posted as review comments
+ */
   async createReview(
     prNumber: number,
     commitId: string,
     summary: string,
     comments?: ReviewComment[]
   ): Promise<void> {
-    const reviewComments = comments?.map(c => ({
-      path: c.path,
-      line: c.line,
-      body: this.formatCommentBody(c.body, c.severity),
-    })) || [];
+    // Post summary as a separate issue comment (PR comment, not review)
+    const formattedSummary = `# 📋 PR Summary\n\n${summary}`;
+    await this.postComment(prNumber, formattedSummary);
+    core.info(`✅ Posted summary as PR comment`);
 
-    try {
-      await this.octokit.rest.pulls.createReview({
-        owner: this.owner,
-        repo: this.repo,
-        pull_number: prNumber,
-        commit_id: commitId,
-        body: summary,
-        event: "COMMENT",
-        comments: reviewComments,
-      });
-    } catch (error) {
-      core.warning(`Batch review failed, falling back to individual comments: ${error}`);
+    // Post inline comments as a review (without body/summary)
+    if (comments && comments.length > 0) {
+      const reviewComments = comments.map(c => ({
+        path: c.path,
+        line: c.line,
+        body: this.formatCommentBody(c.body, c.severity),
+      }));
 
-      await this.postComment(prNumber, summary);
+      try {
+        await this.octokit.rest.pulls.createReview({
+          owner: this.owner,
+          repo: this.repo,
+          pull_number: prNumber,
+          commit_id: commitId,
+          event: "COMMENT",
+          comments: reviewComments,
+          // No body here - summary is posted separately
+        });
+        core.info(`✅ Posted ${reviewComments.length} inline review comments`);
+      } catch (error) {
+        core.warning(`Batch review failed, falling back to individual comments: ${error}`);
 
-      for (const comment of reviewComments) {
-        try {
-          await this.octokit.rest.pulls.createReviewComment({
-            owner: this.owner,
-            repo: this.repo,
-            pull_number: prNumber,
-            commit_id: commitId,
-            path: comment.path,
-            line: comment.line,
-            body: comment.body,
-          });
-        } catch (commentError) {
-          core.warning(`Failed to post comment on ${comment.path}:${comment.line}: ${commentError}`);
+        for (const comment of reviewComments) {
+          try {
+            await this.octokit.rest.pulls.createReviewComment({
+              owner: this.owner,
+              repo: this.repo,
+              pull_number: prNumber,
+              commit_id: commitId,
+              path: comment.path,
+              line: comment.line,
+              body: comment.body,
+            });
+          } catch (commentError) {
+            core.warning(`Failed to post comment on ${comment.path}:${comment.line}: ${commentError}`);
+          }
         }
       }
     }
